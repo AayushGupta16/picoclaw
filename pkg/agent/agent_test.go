@@ -520,16 +520,19 @@ func TestProcessMessage_IncludesCurrentSenderInDynamicContext(t *testing.T) {
 		t.Fatal("provider did not receive any messages")
 	}
 
+	// The dynamic sender context is delivered in the current user turn — not
+	// the system prompt — so the prompt prefix stays cache-stable.
 	systemPrompt := provider.lastMessages[0].Content
 	wantSender := "## Current Sender\nCurrent sender: Alice (ID: discord:123)"
-	if !strings.Contains(systemPrompt, wantSender) {
-		t.Fatalf("system prompt missing sender context %q:\n%s", wantSender, systemPrompt)
+	if strings.Contains(systemPrompt, wantSender) {
+		t.Fatalf("system prompt must not contain sender context %q:\n%s", wantSender, systemPrompt)
 	}
 
 	lastMessage := provider.lastMessages[len(provider.lastMessages)-1]
-	if lastMessage.Role != "user" || lastMessage.Content != "hello" {
-		t.Fatalf("last provider message = %+v, want unchanged user message", lastMessage)
+	if !strings.Contains(lastMessage.Content, wantSender) {
+		t.Fatalf("user turn missing sender context %q:\n%s", wantSender, lastMessage.Content)
 	}
+	assertUserTurnWithRuntimeContext(t, lastMessage, "hello")
 }
 
 func TestProcessMessage_DoesNotPassImplicitThinkingOffToCapableProvider(t *testing.T) {
@@ -1079,9 +1082,7 @@ func TestProcessMessage_UseCommandLoadsRequestedSkill(t *testing.T) {
 	}
 
 	lastMessage := provider.lastMessages[len(provider.lastMessages)-1]
-	if lastMessage.Role != "user" || lastMessage.Content != "explain how to list files" {
-		t.Fatalf("last provider message = %+v, want rewritten user message", lastMessage)
-	}
+	assertUserTurnWithRuntimeContext(t, lastMessage, "explain how to list files")
 }
 
 func TestProcessMessage_BtwCommandRunsWithoutPersistingHistory(t *testing.T) {
@@ -1150,9 +1151,7 @@ func TestProcessMessage_BtwCommandRunsWithoutPersistingHistory(t *testing.T) {
 	}
 
 	lastMessage := provider.lastMessages[len(provider.lastMessages)-1]
-	if lastMessage.Role != "user" || lastMessage.Content != "explain side effects" {
-		t.Fatalf("last provider message = %+v, want stripped /btw question", lastMessage)
-	}
+	assertUserTurnWithRuntimeContext(t, lastMessage, "explain side effects")
 
 	history := al.GetRegistry().GetDefaultAgent().Sessions.GetHistory(sessionKey)
 	if !reflect.DeepEqual(history, initialHistory) {
@@ -1198,18 +1197,16 @@ func TestProcessMessage_BtwCommandIncludesRequestContextAndMedia(t *testing.T) {
 		t.Fatal("provider did not receive any messages")
 	}
 
-	systemPrompt := provider.lastMessages[0].Content
-	if !strings.Contains(systemPrompt, "## Current Session\nChannel: discord\nChat ID: group-1") {
-		t.Fatalf("system prompt missing current session context:\n%s", systemPrompt)
-	}
-	if !strings.Contains(systemPrompt, "## Current Sender\nCurrent sender: Alice (ID: discord:123)") {
-		t.Fatalf("system prompt missing current sender context:\n%s", systemPrompt)
-	}
-
+	// Request context (session, sender) is delivered in the current user turn
+	// rather than the system prompt to keep the prompt prefix cache-stable.
 	lastMessage := provider.lastMessages[len(provider.lastMessages)-1]
-	if lastMessage.Role != "user" || lastMessage.Content != "describe this image" {
-		t.Fatalf("last provider message = %+v, want stripped /btw question", lastMessage)
+	if !strings.Contains(lastMessage.Content, "## Current Session\nChannel: discord\nChat ID: group-1") {
+		t.Fatalf("user turn missing current session context:\n%s", lastMessage.Content)
 	}
+	if !strings.Contains(lastMessage.Content, "## Current Sender\nCurrent sender: Alice (ID: discord:123)") {
+		t.Fatalf("user turn missing current sender context:\n%s", lastMessage.Content)
+	}
+	assertUserTurnWithRuntimeContext(t, lastMessage, "describe this image")
 	if !reflect.DeepEqual(lastMessage.Media, []string{"media://image-1"}) {
 		t.Fatalf("last provider media = %#v, want media ref", lastMessage.Media)
 	}
@@ -1273,9 +1270,7 @@ func TestProcessMessage_BtwCommandUsesIsolatedProvider(t *testing.T) {
 
 	// Verify the question was stripped of /btw prefix
 	lastMessage := provider.lastMessages[len(provider.lastMessages)-1]
-	if lastMessage.Role != "user" || lastMessage.Content != "explain isolation" {
-		t.Fatalf("last provider message = %+v, want stripped /btw question", lastMessage)
-	}
+	assertUserTurnWithRuntimeContext(t, lastMessage, "explain isolation")
 
 	// Verify main session history was NOT modified
 	currentHistory := defaultAgent.Sessions.GetHistory(mainSessionKey)
@@ -1506,9 +1501,7 @@ func TestProcessMessage_UseCommandArmsSkillForNextMessage(t *testing.T) {
 		t.Fatalf("system prompt missing pending skill content:\n%s", systemPrompt)
 	}
 	lastMessage := provider.lastMessages[len(provider.lastMessages)-1]
-	if lastMessage.Role != "user" || lastMessage.Content != "explain how to list files" {
-		t.Fatalf("last provider message = %+v, want unchanged follow-up user message", lastMessage)
-	}
+	assertUserTurnWithRuntimeContext(t, lastMessage, "explain how to list files")
 }
 
 func TestApplyExplicitSkillCommand_ArmsSkillForNextMessage(t *testing.T) {

@@ -31,6 +31,24 @@ func setupWorkspace(t *testing.T, files map[string]string) string {
 	return tmpDir
 }
 
+// assertUserTurnWithRuntimeContext verifies msg is a user message carrying the
+// delimited per-request runtime context followed by the original user text.
+// The runtime context (time, session, sender) rides in the current user turn —
+// not the system prompt — so the prompt prefix stays cache-stable.
+func assertUserTurnWithRuntimeContext(t *testing.T, msg providers.Message, wantText string) {
+	t.Helper()
+	if msg.Role != "user" {
+		t.Fatalf("message role = %q, want user: %+v", msg.Role, msg)
+	}
+	if !strings.Contains(msg.Content, "[runtime context]") ||
+		!strings.Contains(msg.Content, "[/runtime context]") {
+		t.Fatalf("user turn missing runtime context delimiters: %q", msg.Content)
+	}
+	if !strings.HasSuffix(msg.Content, wantText) {
+		t.Fatalf("user turn = %q, want suffix %q", msg.Content, wantText)
+	}
+}
+
 // TestSingleSystemMessage verifies that BuildMessages always produces exactly one
 // system message regardless of summary/history variations.
 // Fix: multiple system messages break Anthropic (top-level system param) and
@@ -100,13 +118,27 @@ func TestSingleSystemMessage(t *testing.T) {
 				t.Errorf("last message should be user, got %s", msgs[len(msgs)-1].Role)
 			}
 
-			// System message must contain identity (static) and time (dynamic)
+			// System message must contain identity (static) but NOT the
+			// per-request dynamic context: volatile content in the system
+			// prompt would invalidate provider-side prompt caches every
+			// request. The dynamic context is delivered in the current user
+			// turn instead.
 			sys := msgs[0].Content
 			if !strings.Contains(sys, "picoclaw") {
 				t.Error("system message missing identity")
 			}
-			if !strings.Contains(sys, "Current Time") {
-				t.Error("system message missing dynamic time context")
+			if strings.Contains(sys, "Current Time") {
+				t.Error("system message must not contain dynamic time context (cache prefix stability)")
+			}
+			last := msgs[len(msgs)-1]
+			if !strings.Contains(last.Content, "Current Time") {
+				t.Error("current user turn missing dynamic time context")
+			}
+			if !strings.Contains(last.Content, "[runtime context]") {
+				t.Error("dynamic context in user turn missing [runtime context] delimiter")
+			}
+			if !strings.Contains(last.Content, tt.message) {
+				t.Error("current user turn missing original user message text")
 			}
 
 			// Summary handling
@@ -169,20 +201,28 @@ func TestBuildMessages_CurrentSenderDynamicContext(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			msgs := cb.BuildMessages(nil, "", "hello", nil, "discord", "chat1", tt.senderID, tt.senderDisplayName)
-			sys := msgs[0].Content
 
+			// Dynamic context (including Current Sender) lives in the current
+			// user turn, not the system prompt, to keep the prompt prefix
+			// cache-stable.
+			sys := msgs[0].Content
+			if strings.Contains(sys, "## Current Sender") {
+				t.Fatalf("system prompt must not contain Current Sender section:\n%s", sys)
+			}
+
+			userTurn := msgs[len(msgs)-1].Content
 			if tt.wantSection {
-				if !strings.Contains(sys, "## Current Sender") {
-					t.Fatalf("system prompt missing Current Sender section:\n%s", sys)
+				if !strings.Contains(userTurn, "## Current Sender") {
+					t.Fatalf("user turn missing Current Sender section:\n%s", userTurn)
 				}
-				if !strings.Contains(sys, tt.wantLine) {
-					t.Fatalf("system prompt missing sender line %q:\n%s", tt.wantLine, sys)
+				if !strings.Contains(userTurn, tt.wantLine) {
+					t.Fatalf("user turn missing sender line %q:\n%s", tt.wantLine, userTurn)
 				}
 				return
 			}
 
-			if strings.Contains(sys, "## Current Sender") {
-				t.Fatalf("system prompt should omit Current Sender section:\n%s", sys)
+			if strings.Contains(userTurn, "## Current Sender") {
+				t.Fatalf("user turn should omit Current Sender section:\n%s", userTurn)
 			}
 		})
 	}
@@ -731,11 +771,90 @@ func TestBuildMessages_IncludesMediaOnlyCurrentMessage(t *testing.T) {
 	if userMsg.Role != "user" {
 		t.Fatalf("userMsg.Role = %q, want %q", userMsg.Role, "user")
 	}
-	if userMsg.Content != "" {
-		t.Fatalf("userMsg.Content = %q, want empty string", userMsg.Content)
+	// Media-only turns still carry the runtime context segment (the user sent
+	// no text, so the content is exactly the delimited runtime block).
+	if !strings.Contains(userMsg.Content, "[runtime context]") {
+		t.Fatalf("userMsg.Content = %q, want runtime context segment", userMsg.Content)
 	}
 	if len(userMsg.Media) != 1 || userMsg.Media[0] != "data:image/png;base64,abc123" {
 		t.Fatalf("userMsg.Media = %#v, want image payload", userMsg.Media)
+	}
+}
+
+// TestBuildMessages_DynamicContextPlacement verifies that the volatile runtime
+// context is delivered after conversation history — inside the current user
+// turn — and never in the system message, so the system prompt + history stay
+// a stable, cacheable prefix.
+func TestBuildMessages_DynamicContextPlacement(t *testing.T) {
+	tmpDir := setupWorkspace(t, map[string]string{
+		"AGENT.md": "# Agent\nPlacement test agent.",
+	})
+	defer os.RemoveAll(tmpDir)
+
+	cb := NewContextBuilder(tmpDir)
+
+	history := []providers.Message{
+		{Role: "user", Content: "earlier question"},
+		{Role: "assistant", Content: "earlier answer"},
+	}
+
+	msgs := cb.BuildMessages(history, "", "current question", nil, "test", "chat1", "sender-1", "Sender One")
+
+	// No message before the final user turn may contain the runtime context.
+	for i, m := range msgs[:len(msgs)-1] {
+		if strings.Contains(m.Content, "Current Time") || strings.Contains(m.Content, "[runtime context]") {
+			t.Errorf("message %d (%s) contains runtime context; it must only appear in the final user turn", i, m.Role)
+		}
+	}
+
+	last := msgs[len(msgs)-1]
+	if last.Role != "user" {
+		t.Fatalf("last message role = %q, want user", last.Role)
+	}
+	for _, want := range []string{"[runtime context]", "[/runtime context]", "Current Time", "current question"} {
+		if !strings.Contains(last.Content, want) {
+			t.Errorf("final user turn missing %q:\n%s", want, last.Content)
+		}
+	}
+	// Runtime context precedes the user's text within the turn.
+	if strings.Index(last.Content, "[/runtime context]") > strings.Index(last.Content, "current question") {
+		t.Error("runtime context should precede the user message text in the final turn")
+	}
+}
+
+// TestBuildMessages_HeartbeatRuntimeContext verifies that turns with an empty
+// CurrentMessage (heartbeats) still deliver the runtime context, as a trailing
+// user message of its own.
+func TestBuildMessages_HeartbeatRuntimeContext(t *testing.T) {
+	tmpDir := setupWorkspace(t, map[string]string{
+		"AGENT.md": "# Agent\nHeartbeat test agent.",
+	})
+	defer os.RemoveAll(tmpDir)
+
+	cb := NewContextBuilder(tmpDir)
+
+	history := []providers.Message{
+		{Role: "user", Content: "old message"},
+		{Role: "assistant", Content: "old reply"},
+	}
+
+	msgs := cb.BuildMessages(history, "", "", nil, "test", "chat1", "", "")
+
+	last := msgs[len(msgs)-1]
+	if last.Role != "user" {
+		t.Fatalf("last message role = %q, want user (trailing runtime context message)", last.Role)
+	}
+	for _, want := range []string{"[runtime context]", "Current Time"} {
+		if !strings.Contains(last.Content, want) {
+			t.Errorf("heartbeat trailing user message missing %q:\n%s", want, last.Content)
+		}
+	}
+	if strings.Contains(msgs[0].Content, "Current Time") {
+		t.Error("system message must not contain runtime context on heartbeat turns")
+	}
+	// History must be untouched, directly between system and the runtime turn.
+	if msgs[1].Content != "old message" || msgs[2].Content != "old reply" {
+		t.Errorf("history messages altered: %q / %q", msgs[1].Content, msgs[2].Content)
 	}
 }
 

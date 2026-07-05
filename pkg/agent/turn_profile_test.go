@@ -175,9 +175,7 @@ func TestTurnProfile_HistoryOffSuppressesHistoryAndPersistence(t *testing.T) {
 	if len(provider.messages) != 2 {
 		t.Fatalf("provider messages len = %d, want system + current user", len(provider.messages))
 	}
-	if provider.messages[1].Content != "new user" {
-		t.Fatalf("current message = %q, want new user", provider.messages[1].Content)
-	}
+	assertUserTurnWithRuntimeContext(t, provider.messages[1], "new user")
 	if strings.Contains(provider.messages[0].Content, "old summary") {
 		t.Fatalf("system prompt includes suppressed summary:\n%s", provider.messages[0].Content)
 	}
@@ -216,9 +214,7 @@ func TestTurnProfile_ProcessMessageUsesEnabledTurnProfile(t *testing.T) {
 	if len(provider.messages) != 2 {
 		t.Fatalf("provider messages len = %d, want system + current user", len(provider.messages))
 	}
-	if provider.messages[1].Content != "hello from pico" {
-		t.Fatalf("current message = %q, want hello from pico", provider.messages[1].Content)
-	}
+	assertUserTurnWithRuntimeContext(t, provider.messages[1], "hello from pico")
 }
 
 func TestTurnProfile_BtwCommandUsesEnabledTurnProfile(t *testing.T) {

@@ -103,8 +103,8 @@ func TestBuildMessagesFromPrompt_IncludesSystemPromptOverlay(t *testing.T) {
 	if !strings.Contains(messages[0].Content, "Use child-only system instructions.") {
 		t.Fatalf("system prompt missing overlay: %q", messages[0].Content)
 	}
-	if messages[1].Role != "user" || messages[1].Content != "do child task" {
-		t.Fatalf("messages[1] = %#v, want user task", messages[1])
+	if messages[1].Role != "user" || !strings.HasSuffix(messages[1].Content, "do child task") {
+		t.Fatalf("messages[1] = %#v, want user task (with runtime context prefix)", messages[1])
 	}
 }
 
@@ -121,8 +121,8 @@ func TestBuildMessagesFromPrompt_AttachesInternalPromptMetadata(t *testing.T) {
 	}
 
 	system := messages[0]
-	if len(system.SystemParts) < 3 {
-		t.Fatalf("system parts len = %d, want at least 3", len(system.SystemParts))
+	if len(system.SystemParts) < 2 {
+		t.Fatalf("system parts len = %d, want at least 2", len(system.SystemParts))
 	}
 	if system.SystemParts[0].PromptLayer != string(PromptLayerKernel) ||
 		system.SystemParts[0].PromptSlot != string(PromptSlotIdentity) ||
@@ -130,23 +130,19 @@ func TestBuildMessagesFromPrompt_AttachesInternalPromptMetadata(t *testing.T) {
 		t.Fatalf("static system metadata = %#v, want kernel identity", system.SystemParts[0])
 	}
 
-	var hasRuntime, hasSummary bool
+	var hasSummary bool
 	for _, part := range system.SystemParts {
 		switch part.PromptSource {
 		case string(PromptSourceRuntime):
-			hasRuntime = true
-			if part.CacheControl != nil {
-				t.Fatalf("runtime cache control = %#v, want nil", part.CacheControl)
-			}
+			// The volatile runtime context must not sit in the system message:
+			// it would invalidate the provider-side prompt cache every request.
+			t.Fatalf("runtime context part = %#v, must not be in system message", part)
 		case string(PromptSourceSummary):
 			hasSummary = true
 			if part.CacheControl != nil {
 				t.Fatalf("summary cache control = %#v, want nil", part.CacheControl)
 			}
 		}
-	}
-	if !hasRuntime {
-		t.Fatal("system parts missing runtime prompt metadata")
 	}
 	if !hasSummary {
 		t.Fatal("system parts missing summary prompt metadata")
@@ -157,6 +153,10 @@ func TestBuildMessagesFromPrompt_AttachesInternalPromptMetadata(t *testing.T) {
 		user.PromptSlot != string(PromptSlotMessage) ||
 		user.PromptSource != string(PromptSourceUserMessage) {
 		t.Fatalf("user message metadata = %#v, want turn message", user)
+	}
+	// The runtime context rides in the current user turn instead.
+	if !strings.Contains(user.Content, "[runtime context]") {
+		t.Fatalf("user turn missing runtime context segment: %q", user.Content)
 	}
 
 	data, err := json.Marshal(messages)

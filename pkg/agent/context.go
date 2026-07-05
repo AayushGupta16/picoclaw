@@ -776,7 +776,9 @@ func (cb *ContextBuilder) LoadBootstrapFiles() string {
 }
 
 // buildDynamicContext returns a short dynamic context string with per-request info.
-// This changes every request (time, session) so it is NOT part of the cached prompt.
+// This changes every request (time, session) so it is NOT part of the cached prompt;
+// BuildMessagesFromPrompt delivers it at the tail of the conversation (inside the
+// current user turn) to keep the system prompt a stable, cacheable prefix.
 // LLM-side KV cache reuse is achieved by each provider adapter's native mechanism:
 //   - Anthropic: per-block cache_control (ephemeral) on the static SystemParts block
 //   - OpenAI / Codex: prompt_cache_key for prefix-based caching
@@ -845,8 +847,10 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
 	// The default static part (identity, bootstrap, skills, memory) is cached
 	// locally to avoid repeated file I/O and string building on every call
 	// (fixes issue #607). Profile-customized static prompts are built on demand.
-	// Dynamic parts (time, session, summary) are appended per request unless the
-	// profile suppresses PicoClaw system context.
+	// The optional summary is appended per request unless the profile suppresses
+	// PicoClaw system context; the volatile runtime context (time, session,
+	// sender) is delivered in the current user turn instead so the system
+	// message stays a cache-stable prefix.
 	// Everything is sent as a single system message for provider compatibility:
 	// - Anthropic adapter extracts messages[0] (Role=="system") and maps its content
 	//   to the top-level "system" parameter in the Messages API request. A single
@@ -855,7 +859,7 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
 	// - OpenAI-compat passes messages through as-is.
 	staticPrompt, contentBlocks := cb.buildSystemPromptForRequest(req)
 
-	// Compose a single system message: static (cached) + dynamic + optional summary.
+	// Compose a single system message: static (cached) + overlays + optional summary.
 	// Keeping all system content in one message ensures every provider adapter can
 	// extract it correctly (Anthropic adapter -> top-level system param,
 	// Codex -> instructions field).
@@ -908,27 +912,22 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
 	}
 
 	dynamicChars := 0
+	runtimeCtx := ""
 	if !req.SuppressDefaultSystemPrompt {
-		// Build short dynamic context (time, runtime, session) — changes per request
-		dynamicCtx := cb.buildDynamicContext(
+		// Build short dynamic context (time, runtime, session) — changes per
+		// request. It is NOT part of the system message: volatile content at the
+		// front of the prompt would invalidate provider-side prompt caches
+		// (Anthropic cache_control, OpenAI prefix caching) on every request.
+		// Instead it is delivered at the tail of the conversation, inside the
+		// current user turn (or as its own trailing user message on heartbeat
+		// turns with no user message) — see the end of this function.
+		runtimeCtx = cb.buildDynamicContext(
 			req.Channel,
 			req.ChatID,
 			req.SenderID,
 			req.SenderDisplayName,
 		)
-		dynamicChars = len(dynamicCtx)
-		runtimePart := PromptPart{
-			ID:      "context.runtime",
-			Layer:   PromptLayerContext,
-			Slot:    PromptSlotRuntime,
-			Source:  PromptSource{ID: PromptSourceRuntime, Name: "runtime"},
-			Title:   "runtime context",
-			Content: dynamicCtx,
-			Stable:  false,
-			Cache:   PromptCacheNone,
-		}
-		stringParts = append(stringParts, dynamicCtx)
-		contentBlocks = append(contentBlocks, promptContentBlock(runtimePart, nil))
+		dynamicChars = len(runtimeCtx)
 
 		if req.Summary != "" {
 			summaryPart := PromptPart{
@@ -1010,14 +1009,48 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
 	// Add current user message. Media-only turns must still be preserved so
 	// multimodal providers receive the uploaded image even when the user sends
 	// no accompanying text.
+	//
+	// The per-request runtime context (time, session, sender) rides along as a
+	// clearly-delimited segment at the start of the current user turn. Placing
+	// it after the conversation history keeps the system prompt and history a
+	// stable, cacheable prefix. Heartbeat turns (no user message) deliver it as
+	// a trailing user message of its own. Note: only the raw user message is
+	// persisted to session history, so the runtime segment is rebuilt fresh
+	// each turn and never accumulates in history.
 	if strings.TrimSpace(req.CurrentMessage) != "" || len(req.Media) > 0 {
-		messages = append(messages, userPromptMessage(req.CurrentMessage, req.Media))
+		content := req.CurrentMessage
+		if runtimeCtx != "" {
+			if strings.TrimSpace(content) != "" {
+				content = wrapRuntimeContext(runtimeCtx) + "\n\n" + content
+			} else {
+				content = wrapRuntimeContext(runtimeCtx)
+			}
+		}
+		messages = append(messages, userPromptMessage(content, req.Media))
+	} else if runtimeCtx != "" {
+		messages = append(messages, runtimeContextPromptMessage(runtimeCtx))
 	}
 	if len(messages) == 0 {
 		messages = append(messages, userPromptMessage("", nil))
 	}
 
 	return messages
+}
+
+// wrapRuntimeContext delimits the per-request runtime context so the model can
+// distinguish it from user-authored text inside the same user turn.
+func wrapRuntimeContext(runtimeCtx string) string {
+	return "[runtime context]\n" + runtimeCtx + "\n[/runtime context]"
+}
+
+// runtimeContextPromptMessage wraps the runtime context as a standalone
+// trailing user message for turns that carry no user message (heartbeats).
+func runtimeContextPromptMessage(runtimeCtx string) providers.Message {
+	msg := providers.Message{
+		Role:    "user",
+		Content: wrapRuntimeContext(runtimeCtx),
+	}
+	return promptMessageWithMetadata(msg, PromptLayerContext, PromptSlotRuntime, PromptSourceRuntime)
 }
 
 func sanitizeHistoryForProvider(history []providers.Message) []providers.Message {
