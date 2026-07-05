@@ -582,6 +582,85 @@ func TestBuildRequestBody_MessageCacheBreakpoints(t *testing.T) {
 	})
 }
 
+// TestBuildRequestBody_SamplingParamGuard verifies that sampling parameters
+// are omitted for models whose native Messages API rejects them (400) and
+// retained for everything else.
+func TestBuildRequestBody_SamplingParamGuard(t *testing.T) {
+	tests := []struct {
+		name            string
+		model           string
+		wantTemperature bool
+	}{
+		{name: "opus-4-8 omits temperature", model: "claude-opus-4-8", wantTemperature: false},
+		{name: "opus-4-7 omits temperature", model: "claude-opus-4-7", wantTemperature: false},
+		{name: "fable-5 omits temperature", model: "claude-fable-5", wantTemperature: false},
+		{name: "mythos-5 omits temperature", model: "claude-mythos-5", wantTemperature: false},
+		{name: "dotted config ID omits temperature", model: "claude-opus-4.8", wantTemperature: false},
+		{name: "match is case-insensitive", model: "Claude-Opus-4-8", wantTemperature: false},
+		{name: "sonnet-4-6 retains temperature", model: "claude-sonnet-4-6", wantTemperature: true},
+		{name: "opus-4-6 retains temperature", model: "claude-opus-4-6", wantTemperature: true},
+		{name: "haiku retains temperature", model: "claude-haiku-4-5", wantTemperature: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			options := map[string]any{
+				"max_tokens":  1024,
+				"temperature": 0.7,
+				"top_p":       0.9,
+				"top_k":       int64(40),
+			}
+			got, err := buildRequestBody(
+				[]Message{{Role: "user", Content: "hi"}},
+				nil,
+				tt.model,
+				options,
+			)
+			if err != nil {
+				t.Fatalf("buildRequestBody() error: %v", err)
+			}
+
+			temp, hasTemp := got["temperature"]
+			if tt.wantTemperature {
+				if !hasTemp || temp != 0.7 {
+					t.Fatalf("temperature = %v (present=%v), want 0.7 retained", temp, hasTemp)
+				}
+			} else if hasTemp {
+				t.Fatalf("temperature = %v, want omitted for model %q", temp, tt.model)
+			}
+
+			// top_p / top_k must never be forwarded by this provider.
+			if _, ok := got["top_p"]; ok {
+				t.Fatalf("top_p present in request body for model %q", tt.model)
+			}
+			if _, ok := got["top_k"]; ok {
+				t.Fatalf("top_k present in request body for model %q", tt.model)
+			}
+		})
+	}
+}
+
+func TestModelRejectsSamplingParams(t *testing.T) {
+	rejecting := []string{
+		"claude-opus-4-7", "claude-opus-4-8", "claude-fable-5", "claude-mythos-5",
+		"claude-opus-4.7", "claude-opus-4.8", "CLAUDE-FABLE-5",
+	}
+	for _, model := range rejecting {
+		if !modelRejectsSamplingParams(model) {
+			t.Errorf("modelRejectsSamplingParams(%q) = false, want true", model)
+		}
+	}
+
+	accepting := []string{
+		"claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5", "glm-4", "",
+	}
+	for _, model := range accepting {
+		if modelRejectsSamplingParams(model) {
+			t.Errorf("modelRejectsSamplingParams(%q) = true, want false", model)
+		}
+	}
+}
+
 func TestParseResponseBody(t *testing.T) {
 	tests := []struct {
 		name    string

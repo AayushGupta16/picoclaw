@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/providers/common"
 	"github.com/sipeed/picoclaw/pkg/providers/protocoltypes"
 )
@@ -179,8 +180,18 @@ func buildRequestBody(
 		"messages":   []any{},
 	}
 
-	// Set temperature from options
-	if temp, ok := common.AsFloat(options["temperature"]); ok {
+	// Set temperature from options. Anthropic's native Messages API rejects
+	// temperature/top_p/top_k on Opus 4.7+ and Fable/Mythos 5 with a 400, so
+	// sampling params are omitted entirely for those models.
+	if modelRejectsSamplingParams(model) {
+		if dropped := samplingParamsInOptions(options); len(dropped) > 0 {
+			logger.DebugCF("provider.anthropic_messages",
+				"dropping sampling params rejected by model", map[string]any{
+					"model":  model,
+					"params": dropped,
+				})
+		}
+	} else if temp, ok := common.AsFloat(options["temperature"]); ok {
 		result["temperature"] = temp
 	}
 
@@ -338,6 +349,40 @@ func buildRequestBody(
 	}
 
 	return result, nil
+}
+
+// samplingRestrictedModelFamilies lists the model families whose native
+// Messages API rejects temperature/top_p/top_k with a 400 error.
+var samplingRestrictedModelFamilies = []string{
+	"opus-4-7",
+	"opus-4-8",
+	"fable-5",
+	"mythos-5",
+}
+
+// modelRejectsSamplingParams reports whether the given model rejects sampling
+// parameters. Matching is case-insensitive and tolerates dotted config-style
+// IDs (e.g. "claude-opus-4.8" as well as "claude-opus-4-8").
+func modelRejectsSamplingParams(model string) bool {
+	normalized := strings.ToLower(strings.ReplaceAll(model, ".", "-"))
+	for _, family := range samplingRestrictedModelFamilies {
+		if strings.Contains(normalized, family) {
+			return true
+		}
+	}
+	return false
+}
+
+// samplingParamsInOptions returns which sampling-parameter keys are present in
+// the request options, for drop logging.
+func samplingParamsInOptions(options map[string]any) []string {
+	var present []string
+	for _, key := range []string{"temperature", "top_p", "top_k"} {
+		if _, ok := options[key]; ok {
+			present = append(present, key)
+		}
+	}
+	return present
 }
 
 // clampSystemCacheBreakpoints enforces Anthropic's cache_control marker limit
