@@ -36,6 +36,10 @@ const (
 	defaultAPIVersion     = "2023-06-01"
 	defaultBaseURL        = "https://api.anthropic.com/v1"
 	defaultRequestTimeout = 120 * time.Second
+
+	// maxCacheBreakpoints is Anthropic's limit on cache_control markers per
+	// request (system blocks + message blocks combined).
+	maxCacheBreakpoints = 4
 )
 
 // Provider implements Anthropic Messages API via HTTP (without SDK).
@@ -317,6 +321,13 @@ func buildRequestBody(
 	// byte-identical behavior for callers that never populate them.
 	if hasSystemParts && len(systemBlocks) > 0 {
 		result["system"] = systemBlocks
+
+		// Rolling conversation breakpoints: mark the most recent user turns so
+		// the growing history prefix is cached incrementally across requests.
+		// SystemParts presence is the cache-aware caller's opt-in signal, so
+		// message markers are scoped to it as well.
+		systemBreakpoints := clampSystemCacheBreakpoints(systemBlocks, maxCacheBreakpoints)
+		applyMessageCacheBreakpoints(apiMessages, maxCacheBreakpoints-systemBreakpoints)
 	} else if systemPrompt != "" {
 		result["system"] = systemPrompt
 	}
@@ -327,6 +338,66 @@ func buildRequestBody(
 	}
 
 	return result, nil
+}
+
+// clampSystemCacheBreakpoints enforces Anthropic's cache_control marker limit
+// on the system block array, stripping markers from the EARLIEST blocks when
+// the caller marked more than the limit. The last markers are kept because a
+// breakpoint caches the entire prefix before it — the final marked block
+// covers everything an earlier marker would have, so dropping early markers
+// only removes intermediate read points, never coverage. Returns the number of
+// markers retained.
+func clampSystemCacheBreakpoints(systemBlocks []any, limit int) int {
+	marked := make([]map[string]any, 0, len(systemBlocks))
+	for _, b := range systemBlocks {
+		if block, ok := b.(map[string]any); ok {
+			if _, hasMarker := block["cache_control"]; hasMarker {
+				marked = append(marked, block)
+			}
+		}
+	}
+	if len(marked) <= limit {
+		return len(marked)
+	}
+	for _, block := range marked[:len(marked)-limit] {
+		delete(block, "cache_control")
+	}
+	return limit
+}
+
+// applyMessageCacheBreakpoints attaches {"cache_control": {"type": "ephemeral"}}
+// to the last content block of the most recent user-role messages (including
+// tool_result user messages), walking backwards until the breakpoint budget is
+// exhausted. Older messages keep no markers: as the conversation grows the
+// window rolls forward, and Anthropic's prefix cache still hits on the
+// breakpoints written by the previous request. String content is converted to
+// a single-element text block array so it can carry the marker.
+func applyMessageCacheBreakpoints(apiMessages []any, budget int) {
+	for i := len(apiMessages) - 1; i >= 0 && budget > 0; i-- {
+		msg, ok := apiMessages[i].(map[string]any)
+		if !ok || msg["role"] != "user" {
+			continue
+		}
+
+		switch content := msg["content"].(type) {
+		case string:
+			if content == "" {
+				continue
+			}
+			msg["content"] = []map[string]any{{
+				"type":          "text",
+				"text":          content,
+				"cache_control": map[string]any{"type": "ephemeral"},
+			}}
+			budget--
+		case []map[string]any:
+			if len(content) == 0 {
+				continue
+			}
+			content[len(content)-1]["cache_control"] = map[string]any{"type": "ephemeral"}
+			budget--
+		}
+	}
 }
 
 // buildTools converts tool definitions to Anthropic format.

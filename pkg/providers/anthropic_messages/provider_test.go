@@ -8,6 +8,7 @@ package anthropicmessages
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -320,6 +321,265 @@ func TestBuildRequestBody_SystemPartsBlocks(t *testing.T) {
 			}
 		})
 	}
+}
+
+// countMessageCacheMarkers returns how many content blocks across all API
+// messages carry a cache_control marker, plus the indexes of marked messages.
+func countMessageCacheMarkers(t *testing.T, apiMessages []any) (int, []int) {
+	t.Helper()
+	total := 0
+	var marked []int
+	for i, m := range apiMessages {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			t.Fatalf("message %d is not a map: %T", i, m)
+		}
+		msgMarked := false
+		switch content := msg["content"].(type) {
+		case string:
+			// plain string content cannot carry a marker
+		case []map[string]any:
+			for _, block := range content {
+				if _, ok := block["cache_control"]; ok {
+					total++
+					msgMarked = true
+				}
+			}
+		case []any:
+			for _, b := range content {
+				if block, ok := b.(map[string]any); ok {
+					if _, ok := block["cache_control"]; ok {
+						total++
+						msgMarked = true
+					}
+				}
+			}
+		}
+		if msgMarked {
+			marked = append(marked, i)
+		}
+	}
+	return total, marked
+}
+
+func cachedSystemMessage() Message {
+	return Message{
+		Role:    "system",
+		Content: "static prompt",
+		SystemParts: []ContentBlock{
+			{Type: "text", Text: "static prompt", CacheControl: &CacheControl{Type: "ephemeral"}},
+		},
+	}
+}
+
+// TestBuildRequestBody_MessageCacheBreakpoints verifies rolling cache_control
+// breakpoints on the most recent user messages, bounded to Anthropic's
+// four-marker budget together with the system-block breakpoints.
+func TestBuildRequestBody_MessageCacheBreakpoints(t *testing.T) {
+	t.Run("markers on most recent user messages only, total <= 4", func(t *testing.T) {
+		messages := []Message{
+			cachedSystemMessage(), // 1 system breakpoint -> 3 left for messages
+			{Role: "user", Content: "turn 1"},
+			{Role: "assistant", Content: "reply 1"},
+			{Role: "user", Content: "turn 2"},
+			{Role: "assistant", Content: "reply 2"},
+			{Role: "user", Content: "turn 3"},
+			{Role: "assistant", Content: "reply 3"},
+			{Role: "user", Content: "turn 4"},
+			{Role: "assistant", Content: "reply 4"},
+			{Role: "user", Content: "turn 5"},
+		}
+
+		got, err := buildRequestBody(messages, nil, "test-model", map[string]any{"max_tokens": 8192})
+		if err != nil {
+			t.Fatalf("buildRequestBody() error: %v", err)
+		}
+
+		apiMessages := got["messages"].([]any)
+		total, marked := countMessageCacheMarkers(t, apiMessages)
+		if total != 3 {
+			t.Fatalf("message markers = %d, want 3 (4 minus 1 system breakpoint); marked=%v", total, marked)
+		}
+		// The 3 most recent user messages are at indexes 4, 6, 8 (turns 3-5).
+		want := []int{4, 6, 8}
+		if !reflect.DeepEqual(marked, want) {
+			t.Fatalf("marked message indexes = %v, want %v", marked, want)
+		}
+
+		// Oldest user messages keep plain string content (no conversion).
+		first := apiMessages[0].(map[string]any)
+		if _, isString := first["content"].(string); !isString {
+			t.Fatalf("oldest user message content = %T, want plain string", first["content"])
+		}
+	})
+
+	t.Run("string content converted to single text block with marker", func(t *testing.T) {
+		messages := []Message{
+			cachedSystemMessage(),
+			{Role: "user", Content: "hello"},
+		}
+
+		got, err := buildRequestBody(messages, nil, "test-model", map[string]any{"max_tokens": 8192})
+		if err != nil {
+			t.Fatalf("buildRequestBody() error: %v", err)
+		}
+
+		apiMessages := got["messages"].([]any)
+		userMsg := apiMessages[0].(map[string]any)
+		wantContent := []map[string]any{{
+			"type":          "text",
+			"text":          "hello",
+			"cache_control": map[string]any{"type": "ephemeral"},
+		}}
+		if !reflect.DeepEqual(userMsg["content"], wantContent) {
+			gotJSON, _ := json.MarshalIndent(userMsg["content"], "", "  ")
+			t.Fatalf("converted content mismatch:\n%s", gotJSON)
+		}
+	})
+
+	t.Run("tool_result user message gets marker on last block only", func(t *testing.T) {
+		messages := []Message{
+			cachedSystemMessage(),
+			{Role: "user", Content: "run tools"},
+			{Role: "assistant", Content: "", ToolCalls: []ToolCall{
+				{ID: "t1", Name: "tool_a", Arguments: map[string]any{"x": 1}},
+				{ID: "t2", Name: "tool_b", Arguments: map[string]any{"y": 2}},
+			}},
+			{Role: "tool", ToolCallID: "t1", Content: "result1"},
+			{Role: "tool", ToolCallID: "t2", Content: "result2"},
+		}
+
+		got, err := buildRequestBody(messages, nil, "test-model", map[string]any{"max_tokens": 8192})
+		if err != nil {
+			t.Fatalf("buildRequestBody() error: %v", err)
+		}
+
+		apiMessages := got["messages"].([]any)
+		toolResultMsg := apiMessages[2].(map[string]any)
+		content := toolResultMsg["content"].([]map[string]any)
+		if len(content) != 2 {
+			t.Fatalf("tool_result blocks = %d, want 2", len(content))
+		}
+		if _, ok := content[0]["cache_control"]; ok {
+			t.Error("first tool_result block should not carry cache_control")
+		}
+		if _, ok := content[1]["cache_control"]; !ok {
+			t.Error("last tool_result block should carry cache_control")
+		}
+	})
+
+	t.Run("no message markers without SystemParts", func(t *testing.T) {
+		messages := []Message{
+			{Role: "system", Content: "flat prompt"},
+			{Role: "user", Content: "hello"},
+		}
+
+		got, err := buildRequestBody(messages, nil, "test-model", map[string]any{"max_tokens": 8192})
+		if err != nil {
+			t.Fatalf("buildRequestBody() error: %v", err)
+		}
+
+		apiMessages := got["messages"].([]any)
+		total, _ := countMessageCacheMarkers(t, apiMessages)
+		if total != 0 {
+			t.Fatalf("message markers = %d, want 0 for flat-string system prompt", total)
+		}
+		userMsg := apiMessages[0].(map[string]any)
+		if _, isString := userMsg["content"].(string); !isString {
+			t.Fatalf("user content = %T, want untouched plain string", userMsg["content"])
+		}
+	})
+
+	t.Run("four system breakpoints leave no message budget", func(t *testing.T) {
+		var parts []ContentBlock
+		for i := 0; i < 4; i++ {
+			parts = append(parts, ContentBlock{
+				Type:         "text",
+				Text:         fmt.Sprintf("part %d", i),
+				CacheControl: &CacheControl{Type: "ephemeral"},
+			})
+		}
+		messages := []Message{
+			{Role: "system", Content: "static", SystemParts: parts},
+			{Role: "user", Content: "hello"},
+		}
+
+		got, err := buildRequestBody(messages, nil, "test-model", map[string]any{"max_tokens": 8192})
+		if err != nil {
+			t.Fatalf("buildRequestBody() error: %v", err)
+		}
+
+		apiMessages := got["messages"].([]any)
+		total, _ := countMessageCacheMarkers(t, apiMessages)
+		if total != 0 {
+			t.Fatalf("message markers = %d, want 0 when system uses all 4 breakpoints", total)
+		}
+	})
+
+	t.Run("excess system markers are clamped to the last four", func(t *testing.T) {
+		var parts []ContentBlock
+		for i := 0; i < 6; i++ {
+			parts = append(parts, ContentBlock{
+				Type:         "text",
+				Text:         fmt.Sprintf("part %d", i),
+				CacheControl: &CacheControl{Type: "ephemeral"},
+			})
+		}
+		messages := []Message{
+			{Role: "system", Content: "static", SystemParts: parts},
+			{Role: "user", Content: "hello"},
+		}
+
+		got, err := buildRequestBody(messages, nil, "test-model", map[string]any{"max_tokens": 8192})
+		if err != nil {
+			t.Fatalf("buildRequestBody() error: %v", err)
+		}
+
+		systemBlocks := got["system"].([]any)
+		markers := 0
+		for i, b := range systemBlocks {
+			block := b.(map[string]any)
+			_, hasMarker := block["cache_control"]
+			if hasMarker {
+				markers++
+			}
+			// The first two (earliest) markers must be stripped; the last four kept.
+			if i < 2 && hasMarker {
+				t.Errorf("system block %d should have had its marker stripped", i)
+			}
+			if i >= 2 && !hasMarker {
+				t.Errorf("system block %d should have kept its marker", i)
+			}
+		}
+		if markers != 4 {
+			t.Fatalf("system markers = %d, want clamped to 4", markers)
+		}
+
+		apiMessages := got["messages"].([]any)
+		total, _ := countMessageCacheMarkers(t, apiMessages)
+		if total != 0 {
+			t.Fatalf("message markers = %d, want 0 when system consumes the full budget", total)
+		}
+	})
+
+	t.Run("empty user content is skipped", func(t *testing.T) {
+		messages := []Message{
+			cachedSystemMessage(),
+			{Role: "user", Content: "real turn"},
+			{Role: "user", Content: ""},
+		}
+
+		got, err := buildRequestBody(messages, nil, "test-model", map[string]any{"max_tokens": 8192})
+		if err != nil {
+			t.Fatalf("buildRequestBody() error: %v", err)
+		}
+
+		apiMessages := got["messages"].([]any)
+		total, marked := countMessageCacheMarkers(t, apiMessages)
+		if total != 1 || !reflect.DeepEqual(marked, []int{0}) {
+			t.Fatalf("markers = %d at %v, want 1 marker on message 0 only", total, marked)
+		}
+	})
 }
 
 func TestParseResponseBody(t *testing.T) {
