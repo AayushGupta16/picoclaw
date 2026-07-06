@@ -247,13 +247,6 @@ func TestMtimeAutoInvalidation(t *testing.T) {
 			contentV2:  "# Updated Agent",
 			checkField: "Updated Agent",
 		},
-		{
-			name:       "memory file change",
-			file:       "memory/MEMORY.md",
-			contentV1:  "# Memory\nUser likes Go.",
-			contentV2:  "# Memory\nUser likes Rust.",
-			checkField: "User likes Rust",
-		},
 	}
 
 	for _, tt := range tests {
@@ -291,6 +284,39 @@ func TestMtimeAutoInvalidation(t *testing.T) {
 			}
 		})
 	}
+
+	// Memory deliberately lives OUTSIDE the cached static prompt: agents edit
+	// their memory file nearly every turn, and memory bytes at the front of
+	// the prompt invalidated the provider-side prefix cache on every edit.
+	// It is delivered live via BuildMessagesFromPrompt as the final system
+	// block instead — so a change must show up there, and must NOT show up
+	// in (or invalidate expectations about) the static prompt.
+	t.Run("memory file change flows through messages, not the static prompt", func(t *testing.T) {
+		tmpDir := setupWorkspace(t, map[string]string{
+			"memory/MEMORY.md": "# Memory\nUser likes Go.",
+		})
+		defer os.RemoveAll(tmpDir)
+
+		cb := NewContextBuilder(tmpDir)
+
+		if sp := cb.BuildSystemPromptWithCache(); strings.Contains(sp, "User likes Go") {
+			t.Fatal("static prompt must not embed memory content")
+		}
+		sys1 := buildSystemMessageContent(t, cb)
+		if !strings.Contains(sys1, "User likes Go") {
+			t.Fatalf("system message missing memory content:\n%s", sys1)
+		}
+
+		fullPath := filepath.Join(tmpDir, "memory/MEMORY.md")
+		if err := os.WriteFile(fullPath, []byte("# Memory\nUser likes Rust."), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		sys2 := buildSystemMessageContent(t, cb)
+		if !strings.Contains(sys2, "User likes Rust") {
+			t.Fatalf("system message missing updated memory content:\n%s", sys2)
+		}
+	})
 
 	// Skills directory mtime change
 	t.Run("skills dir change", func(t *testing.T) {
@@ -387,12 +413,6 @@ func TestNewFileCreationInvalidatesCache(t *testing.T) {
 			content:    "# Soul\nBe kind and helpful.",
 			checkField: "Be kind and helpful",
 		},
-		{
-			name:       "new memory file",
-			file:       "memory/MEMORY.md",
-			content:    "# Memory\nUser prefers dark mode.",
-			checkField: "User prefers dark mode",
-		},
 	}
 
 	for _, tt := range tests {
@@ -426,6 +446,43 @@ func TestNewFileCreationInvalidatesCache(t *testing.T) {
 			}
 		})
 	}
+
+	// Memory is read live per request (never inside the static prompt), so a
+	// newly created memory file must appear in the built messages without any
+	// cache invalidation involved.
+	t.Run("new memory file appears via messages", func(t *testing.T) {
+		tmpDir := setupWorkspace(t, nil)
+		defer os.RemoveAll(tmpDir)
+
+		cb := NewContextBuilder(tmpDir)
+
+		if sys := buildSystemMessageContent(t, cb); strings.Contains(sys, "User prefers dark mode") {
+			t.Fatal("system message should not contain memory before the file exists")
+		}
+
+		fullPath := filepath.Join(tmpDir, "memory", "MEMORY.md")
+		os.MkdirAll(filepath.Dir(fullPath), 0o755)
+		if err := os.WriteFile(fullPath, []byte("# Memory\nUser prefers dark mode."), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		if sys := buildSystemMessageContent(t, cb); !strings.Contains(sys, "User prefers dark mode") {
+			t.Fatalf("system message missing new memory content:\n%s", sys)
+		}
+	})
+}
+
+// buildSystemMessageContent renders a request through BuildMessagesFromPrompt
+// and returns the system message's concatenated content — the surface where
+// workspace memory is delivered (it is intentionally not part of the cached
+// static prompt).
+func buildSystemMessageContent(t *testing.T, cb *ContextBuilder) string {
+	t.Helper()
+	messages := cb.BuildMessagesFromPrompt(PromptBuildRequest{CurrentMessage: "hi"})
+	if len(messages) == 0 || messages[0].Role != "system" {
+		t.Fatalf("expected leading system message, got %d messages", len(messages))
+	}
+	return messages[0].Content
 }
 
 // TestSkillFileContentChange verifies that modifying a skill file's content

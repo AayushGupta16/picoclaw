@@ -220,6 +220,23 @@ func (cb *ContextBuilder) BuildSystemPrompt() string {
 	return renderPromptPartsLegacy(cb.BuildSystemPromptParts())
 }
 
+// buildMemoryPromptPart wraps workspace memory as the final system block.
+// Ephemeral cache marker on purpose: memory is the churn hotspot of the
+// system prefix, and the marker localizes each edit's cache rewrite to this
+// block (everything before it keeps reading from cache).
+func buildMemoryPromptPart(memoryContext string) PromptPart {
+	return PromptPart{
+		ID:      "context.memory",
+		Layer:   PromptLayerContext,
+		Slot:    PromptSlotMemory,
+		Source:  PromptSource{ID: PromptSourceMemory, Name: "memory:workspace"},
+		Title:   "memory",
+		Content: "# Memory\n\n" + memoryContext,
+		Stable:  true,
+		Cache:   PromptCacheEphemeral,
+	}
+}
+
 func (cb *ContextBuilder) BuildSystemPromptParts() []PromptPart {
 	return cb.buildSystemPromptParts(systemPromptBuildOptions{
 		IncludeSkillCatalog: true,
@@ -305,20 +322,12 @@ func (cb *ContextBuilder) buildSystemPromptParts(opts systemPromptBuildOptions) 
 		})
 	}
 
-	// Memory context
-	memoryContext := cb.memory.GetMemoryContext()
-	if memoryContext != "" {
-		add(PromptPart{
-			ID:      "context.memory",
-			Layer:   PromptLayerContext,
-			Slot:    PromptSlotMemory,
-			Source:  PromptSource{ID: PromptSourceMemory, Name: "memory:workspace"},
-			Title:   "memory",
-			Content: "# Memory\n\n" + memoryContext,
-			Stable:  true,
-			Cache:   PromptCacheEphemeral,
-		})
-	}
+	// Workspace memory is deliberately NOT part of these parts: agents edit
+	// their memory file constantly, and memory content at the front of the
+	// prompt invalidated the entire provider-side prompt cache (system +
+	// skills + everything downstream) on every edit. BuildMessagesFromPrompt
+	// appends memory as the LAST system block with its own cache marker, so
+	// an edit rewrites only the memory span. See buildMemoryPromptPart.
 
 	// Multi-Message Sending (if enabled)
 	if cb.splitOnMarker {
@@ -511,6 +520,14 @@ func (cb *ContextBuilder) EstimateSystemTokens(summary string, activeSkills []st
 		const summaryPrefix = "CONTEXT_SUMMARY: The following is an approximate summary of prior conversation " +
 			"for reference only. It may be incomplete or outdated — always defer to explicit instructions.\n\n"
 		totalChars += utf8.RuneCountInString(summaryPrefix) + utf8.RuneCountInString(summary)
+		totalChars += 7 // separator
+	}
+
+	// Workspace memory is appended by BuildMessagesFromPrompt as its own
+	// system block (no longer inside the static prompt) — count it here so
+	// the estimate keeps matching what actually gets sent.
+	if memoryContext := cb.memory.GetMemoryContext(); memoryContext != "" {
+		totalChars += utf8.RuneCountInString("# Memory\n\n") + utf8.RuneCountInString(memoryContext)
 		totalChars += 7 // separator
 	}
 
@@ -946,6 +963,18 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
 			}
 			stringParts = append(stringParts, summaryPart.Content)
 			contentBlocks = append(contentBlocks, promptContentBlock(summaryPart, nil))
+		}
+
+		// Workspace memory goes LAST in the system prefix, with its own cache
+		// marker. It churns more than anything else in system — agents write
+		// their memory file nearly every turn — so everything stable must sit
+		// BEFORE it: an edit then invalidates only this block, and the marker
+		// keeps the rewrite to the memory span instead of the whole prefix
+		// (which is what happened when memory lived inside the static part).
+		if memoryContext := cb.memory.GetMemoryContext(); memoryContext != "" {
+			memoryPart := buildMemoryPromptPart(memoryContext)
+			stringParts = append(stringParts, memoryPart.Content)
+			contentBlocks = append(contentBlocks, promptContentBlock(memoryPart, nil))
 		}
 	}
 
