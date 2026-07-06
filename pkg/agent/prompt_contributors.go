@@ -49,7 +49,13 @@ func (c toolDiscoveryPromptContributor) ContributePrompt(
 			Title:   "tool discovery",
 			Content: content,
 			Stable:  true,
-			Cache:   PromptCacheEphemeral,
+			// No cache marker: this part is a few dozen tokens. Anthropic
+			// allows only 4 cache_control breakpoints per request, and every
+			// marker spent on a tiny system block starves the conversation
+			// history of markers (the provider hands system blocks the budget
+			// first). The part is still cached — it sits inside the prefix
+			// covered by the next marker downstream.
+			Cache: PromptCacheNone,
 		},
 	}, nil
 }
@@ -105,7 +111,12 @@ func (c mcpServerPromptContributor) ContributePrompt(
 				availability,
 			),
 			Stable: true,
-			Cache:  PromptCacheEphemeral,
+			// No cache marker: one sentence per server. With several MCP
+			// servers connected these parts alone exhausted Anthropic's
+			// 4-breakpoint budget, leaving zero markers for conversation
+			// history — the entire message prefix went uncached. The part is
+			// still covered by the next marker downstream.
+			Cache: PromptCacheNone,
 		},
 	}, nil
 }

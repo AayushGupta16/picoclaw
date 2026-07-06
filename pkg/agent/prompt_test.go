@@ -187,8 +187,11 @@ func TestContextBuilder_CollectsToolDiscoveryContributor(t *testing.T) {
 			if part.PromptLayer != string(PromptLayerCapability) || part.PromptSlot != string(PromptSlotTooling) {
 				t.Fatalf("tool discovery metadata = %#v, want capability/tooling", part)
 			}
-			if part.CacheControl == nil || part.CacheControl.Type != "ephemeral" {
-				t.Fatalf("tool discovery cache control = %#v, want ephemeral", part.CacheControl)
+			// Deliberately unmarked: tiny parts must not spend one of
+			// Anthropic's 4 cache breakpoints (they starved the message
+			// markers); the part is covered by the next marker downstream.
+			if part.CacheControl != nil {
+				t.Fatalf("tool discovery cache control = %#v, want nil (no own breakpoint)", part.CacheControl)
 			}
 		}
 	}
@@ -291,8 +294,11 @@ func TestContextBuilder_CollectsMCPServerContributor(t *testing.T) {
 			if part.PromptLayer != string(PromptLayerCapability) || part.PromptSlot != string(PromptSlotMCP) {
 				t.Fatalf("mcp metadata = %#v, want capability/mcp", part)
 			}
-			if part.CacheControl == nil || part.CacheControl.Type != "ephemeral" {
-				t.Fatalf("mcp cache control = %#v, want ephemeral", part.CacheControl)
+			// Deliberately unmarked: one-sentence MCP parts exhausted the
+			// 4-breakpoint budget when several servers were connected,
+			// leaving conversation history permanently uncached.
+			if part.CacheControl != nil {
+				t.Fatalf("mcp cache control = %#v, want nil (no own breakpoint)", part.CacheControl)
 			}
 		}
 	}
