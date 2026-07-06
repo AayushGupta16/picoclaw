@@ -1535,6 +1535,39 @@ func TestLoadConfig_LoadImageCanBeDisabled(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_ReactionToolToggle(t *testing.T) {
+	tests := []struct {
+		name        string
+		toolsJSON   string
+		wantEnabled bool
+	}{
+		{"enabled by default", "{}", true},
+		{"explicit false disables", "{\"reaction\": {\"enabled\": false}}", false},
+		{"explicit true enables", "{\"reaction\": {\"enabled\": true}}", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.json")
+			raw := "{\n  \"version\": 2,\n  \"tools\": " + tt.toolsJSON + "\n}\n"
+			if err := os.WriteFile(configPath, []byte(raw), 0o600); err != nil {
+				t.Fatalf("WriteFile() error: %v", err)
+			}
+
+			cfg, err := LoadConfig(configPath)
+			if err != nil {
+				t.Fatalf("LoadConfig() error: %v", err)
+			}
+			if cfg.Tools.Reaction.Enabled != tt.wantEnabled {
+				t.Fatalf("LoadConfig().Tools.Reaction.Enabled = %v, want %v", cfg.Tools.Reaction.Enabled, tt.wantEnabled)
+			}
+			if got := cfg.Tools.IsToolEnabled("reaction"); got != tt.wantEnabled {
+				t.Fatalf("LoadConfig().Tools.IsToolEnabled(reaction) = %v, want %v", got, tt.wantEnabled)
+			}
+		})
+	}
+}
+
 func TestDefaultConfig_MessageMediaDisabled(t *testing.T) {
 	cfg := DefaultConfig()
 	if !cfg.Tools.Message.Enabled {
