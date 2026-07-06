@@ -372,11 +372,13 @@ func cachedSystemMessage() Message {
 	}
 }
 
-// TestBuildRequestBody_MessageCacheBreakpoints verifies rolling cache_control
-// breakpoints on the most recent user messages, bounded to Anthropic's
-// four-marker budget together with the system-block breakpoints.
+// TestBuildRequestBody_MessageCacheBreakpoints verifies stride-spaced
+// cache_control breakpoints on user messages: the newest user message always
+// carries a marker, earlier markers appear only after breakpointStrideBlocks
+// content blocks, and the total stays within Anthropic's four-marker budget
+// together with the system-block breakpoints.
 func TestBuildRequestBody_MessageCacheBreakpoints(t *testing.T) {
-	t.Run("markers on most recent user messages only, total <= 4", func(t *testing.T) {
+	t.Run("short history: only the newest user message is marked", func(t *testing.T) {
 		messages := []Message{
 			cachedSystemMessage(), // 1 system breakpoint -> 3 left for messages
 			{Role: "user", Content: "turn 1"},
@@ -397,19 +399,85 @@ func TestBuildRequestBody_MessageCacheBreakpoints(t *testing.T) {
 
 		apiMessages := got["messages"].([]any)
 		total, marked := countMessageCacheMarkers(t, apiMessages)
-		if total != 3 {
-			t.Fatalf("message markers = %d, want 3 (4 minus 1 system breakpoint); marked=%v", total, marked)
+		// 8 content blocks precede the newest user message — under the
+		// 15-block stride no earlier message earns a marker. Clustering more
+		// markers here would waste budget without improving chaining.
+		if total != 1 {
+			t.Fatalf("message markers = %d, want 1 (newest only); marked=%v", total, marked)
 		}
-		// The 3 most recent user messages are at indexes 4, 6, 8 (turns 3-5).
-		want := []int{4, 6, 8}
-		if !reflect.DeepEqual(marked, want) {
+		if want := []int{8}; !reflect.DeepEqual(marked, want) {
 			t.Fatalf("marked message indexes = %v, want %v", marked, want)
 		}
 
-		// Oldest user messages keep plain string content (no conversion).
+		// Older user messages keep plain string content (no conversion).
 		first := apiMessages[0].(map[string]any)
 		if _, isString := first["content"].(string); !isString {
 			t.Fatalf("oldest user message content = %T, want plain string", first["content"])
+		}
+	})
+
+	t.Run("long history: markers stride-spaced within the cache lookback", func(t *testing.T) {
+		// 20 rounds of a tool-heavy loop: assistant text+2 tool_use blocks,
+		// then a merged user message with 2 tool_result blocks -> 5 blocks
+		// per round, 100 blocks total.
+		messages := []Message{cachedSystemMessage()}
+		for i := 0; i < 20; i++ {
+			messages = append(messages,
+				Message{Role: "assistant", Content: fmt.Sprintf("step %d", i), ToolCalls: []ToolCall{
+					{ID: fmt.Sprintf("a%d", i), Name: "tool_a", Arguments: map[string]any{"i": i}},
+					{ID: fmt.Sprintf("b%d", i), Name: "tool_b", Arguments: map[string]any{"i": i}},
+				}},
+				Message{Role: "tool", ToolCallID: fmt.Sprintf("a%d", i), Content: "ra"},
+				Message{Role: "tool", ToolCallID: fmt.Sprintf("b%d", i), Content: "rb"},
+			)
+		}
+
+		got, err := buildRequestBody(messages, nil, "test-model", map[string]any{"max_tokens": 8192})
+		if err != nil {
+			t.Fatalf("buildRequestBody() error: %v", err)
+		}
+
+		apiMessages := got["messages"].([]any)
+		total, marked := countMessageCacheMarkers(t, apiMessages)
+		if total != 3 {
+			t.Fatalf("message markers = %d, want 3 (full remaining budget); marked=%v", total, marked)
+		}
+
+		// The newest user message must be marked (it extends the cache).
+		lastUser := -1
+		for i := len(apiMessages) - 1; i >= 0; i-- {
+			if apiMessages[i].(map[string]any)["role"] == "user" {
+				lastUser = i
+				break
+			}
+		}
+		if marked[len(marked)-1] != lastUser {
+			t.Fatalf("newest user message %d not marked; marked=%v", lastUser, marked)
+		}
+
+		// Every gap between consecutive markers (and from the start of the
+		// messages to the first marker... the first marker chains to the
+		// system-block entry, so only inter-marker gaps matter) must stay
+		// within Anthropic's ~20-block lookback, and must be at least the
+		// stride so the budget isn't wasted on adjacent messages.
+		blockIndex := make([]int, len(apiMessages)) // cumulative blocks before message i
+		blocks := 0
+		for i, m := range apiMessages {
+			blockIndex[i] = blocks
+			blocks += messageBlockCount(m.(map[string]any))
+		}
+		for k := 1; k < len(marked); k++ {
+			// Gap = blocks between the two marked blocks (each marker sits on
+			// its message's last block).
+			prevEnd := blockIndex[marked[k-1]] + messageBlockCount(apiMessages[marked[k-1]].(map[string]any))
+			curEnd := blockIndex[marked[k]] + messageBlockCount(apiMessages[marked[k]].(map[string]any))
+			gap := curEnd - prevEnd
+			if gap < breakpointStrideBlocks {
+				t.Errorf("markers %d->%d gap = %d blocks, want >= stride %d", marked[k-1], marked[k], gap, breakpointStrideBlocks)
+			}
+			if gap > 20 {
+				t.Errorf("markers %d->%d gap = %d blocks, exceeds the 20-block cache lookback", marked[k-1], marked[k], gap)
+			}
 		}
 	})
 

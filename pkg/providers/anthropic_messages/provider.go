@@ -41,6 +41,16 @@ const (
 	// maxCacheBreakpoints is Anthropic's limit on cache_control markers per
 	// request (system blocks + message blocks combined).
 	maxCacheBreakpoints = 4
+
+	// breakpointStrideBlocks is the minimum number of content blocks between
+	// consecutive message cache markers. Anthropic's cache lookup walks back
+	// at most ~20 content blocks from a breakpoint to find a prior entry;
+	// markers spaced closer than that chain — each one connects to the
+	// previous marker's entry (or, within a single request, to the entry the
+	// previous marker just created), so a cold cache can rebuild the whole
+	// prefix instead of stranding everything past the system blocks. Spacing
+	// them at 15 leaves headroom for a multi-block message straddling a gap.
+	breakpointStrideBlocks = 15
 )
 
 // Provider implements Anthropic Messages API via HTTP (without SDK).
@@ -425,38 +435,83 @@ func clampSystemCacheBreakpoints(systemBlocks []any, limit int) int {
 }
 
 // applyMessageCacheBreakpoints attaches {"cache_control": {"type": "ephemeral"}}
-// to the last content block of the most recent user-role messages (including
-// tool_result user messages), walking backwards until the breakpoint budget is
-// exhausted. Older messages keep no markers: as the conversation grows the
-// window rolls forward, and Anthropic's prefix cache still hits on the
-// breakpoints written by the previous request. String content is converted to
-// a single-element text block array so it can carry the marker.
+// to the last content block of user-role messages (including tool_result user
+// messages), walking backwards from the newest message until the breakpoint
+// budget is exhausted. The newest user message is always marked — that is what
+// extends the cached prefix as the conversation grows. Earlier markers are
+// placed only after breakpointStrideBlocks content blocks have accumulated
+// since the previous marker, so consecutive breakpoints stay within
+// Anthropic's ~20-block cache lookback of each other: on a cold cache the
+// chain rebuilds front-to-back in one request, and on a warm cache each new
+// tail marker connects to the previous request's tail. (The prior behavior —
+// marking the N most recent user messages with no spacing — clustered every
+// marker at the tail; after any cache miss the gap back to the system blocks
+// exceeded the lookback and conversation content never got cached at all.)
+// String content is converted to a single-element text block array so it can
+// carry the marker.
 func applyMessageCacheBreakpoints(apiMessages []any, budget int) {
-	for i := len(apiMessages) - 1; i >= 0 && budget > 0; i-- {
-		msg, ok := apiMessages[i].(map[string]any)
-		if !ok || msg["role"] != "user" {
-			continue
-		}
+	blocksSinceMarker := 0
+	marked := 0
 
+	mark := func(msg map[string]any) bool {
 		switch content := msg["content"].(type) {
 		case string:
 			if content == "" {
-				continue
+				return false
 			}
 			msg["content"] = []map[string]any{{
 				"type":          "text",
 				"text":          content,
 				"cache_control": map[string]any{"type": "ephemeral"},
 			}}
-			budget--
+			return true
 		case []map[string]any:
 			if len(content) == 0 {
-				continue
+				return false
 			}
 			content[len(content)-1]["cache_control"] = map[string]any{"type": "ephemeral"}
-			budget--
+			return true
 		}
+		return false
 	}
+
+	for i := len(apiMessages) - 1; i >= 0 && marked < budget; i-- {
+		msg, ok := apiMessages[i].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if msg["role"] == "user" &&
+			(marked == 0 || blocksSinceMarker >= breakpointStrideBlocks) &&
+			mark(msg) {
+			marked++
+			// The marker sits on this message's LAST block; its earlier
+			// blocks lie between this marker and the next-older one, so they
+			// count toward the next gap.
+			blocksSinceMarker = messageBlockCount(msg) - 1
+			continue
+		}
+
+		blocksSinceMarker += messageBlockCount(msg)
+	}
+}
+
+// messageBlockCount reports how many content blocks a message contributes to
+// the request, for breakpoint-stride accounting. String content is one text
+// block; block arrays count their elements.
+func messageBlockCount(msg map[string]any) int {
+	switch content := msg["content"].(type) {
+	case string:
+		if content == "" {
+			return 0
+		}
+		return 1
+	case []map[string]any:
+		return len(content)
+	case []any:
+		return len(content)
+	}
+	return 0
 }
 
 // buildTools converts tool definitions to Anthropic format.
