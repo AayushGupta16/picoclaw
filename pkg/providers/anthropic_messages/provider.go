@@ -8,6 +8,7 @@ package anthropicmessages
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -269,10 +270,18 @@ func buildRequestBody(
 					"content": []map[string]any{toolResultBlock},
 				})
 			} else {
-				// Regular user message
+				// Regular user message. Inline images in msg.Media become an
+				// Anthropic content-block array; without media (or when nothing
+				// in it parses) the plain-string form is preserved unchanged.
+				var content any = msg.Content
+				if len(msg.Media) > 0 {
+					if blocks := buildUserContentBlocks(msg.Content, msg.Media); len(blocks) > 0 {
+						content = blocks
+					}
+				}
 				apiMessages = append(apiMessages, map[string]any{
 					"role":    "user",
-					"content": msg.Content,
+					"content": content,
 				})
 			}
 
@@ -373,6 +382,93 @@ func buildRequestBody(
 	}
 
 	return result, nil
+}
+
+// maxImageBytes is Anthropic's per-image decoded size limit (~5MB).
+const maxImageBytes = 5 * 1024 * 1024
+
+// buildUserContentBlocks converts a user message with inline media into
+// Anthropic content blocks: an optional leading text block followed by one
+// image block per parseable data:image/... URL. Entries that are not base64
+// image data URLs of a supported subtype (jpeg/png/gif/webp), or whose decoded
+// payload would exceed Anthropic's ~5MB image limit, are skipped with a
+// warning. Returns nil when no blocks result, so the caller can fall back to
+// plain-string content. Parsing mirrors bedrock's buildUserContent, but the
+// payload stays base64-encoded — the API accepts the string directly.
+func buildUserContentBlocks(text string, media []string) []map[string]any {
+	var blocks []map[string]any
+	if text != "" {
+		blocks = append(blocks, map[string]any{
+			"type": "text",
+			"text": text,
+		})
+	}
+
+	for _, mediaURL := range media {
+		if !strings.HasPrefix(mediaURL, "data:image/") {
+			logger.WarnCF("provider.anthropic_messages",
+				"skipping media entry: not an image data URL", map[string]any{
+					"prefix": truncateForLog(mediaURL),
+				})
+			continue
+		}
+
+		// Parse data URL: data:image/png;base64,<data>
+		parts := strings.SplitN(mediaURL, ",", 2)
+		if len(parts) != 2 || !strings.Contains(parts[0], ";base64") {
+			logger.WarnCF("provider.anthropic_messages",
+				"skipping media entry: image data URL is not base64-encoded", map[string]any{
+					"header": truncateForLog(parts[0]),
+				})
+			continue
+		}
+
+		subtype := strings.TrimPrefix(parts[0], "data:image/")
+		if idx := strings.Index(subtype, ";"); idx != -1 {
+			subtype = subtype[:idx]
+		}
+		switch subtype {
+		case "jpg":
+			subtype = "jpeg"
+		case "jpeg", "png", "gif", "webp":
+		default:
+			logger.WarnCF("provider.anthropic_messages",
+				"skipping media entry: unsupported image type", map[string]any{
+					"subtype": subtype,
+				})
+			continue
+		}
+
+		if decodedLen := base64.StdEncoding.DecodedLen(len(parts[1])); decodedLen > maxImageBytes {
+			logger.WarnCF("provider.anthropic_messages",
+				"skipping media entry: image exceeds size limit", map[string]any{
+					"decoded_bytes": decodedLen,
+					"limit_bytes":   maxImageBytes,
+				})
+			continue
+		}
+
+		blocks = append(blocks, map[string]any{
+			"type": "image",
+			"source": map[string]any{
+				"type":       "base64",
+				"media_type": "image/" + subtype,
+				"data":       parts[1],
+			},
+		})
+	}
+
+	return blocks
+}
+
+// truncateForLog caps a media string for log output so a full base64 payload
+// never lands in the logs.
+func truncateForLog(s string) string {
+	const maxLen = 48
+	if len(s) > maxLen {
+		return s[:maxLen] + "..."
+	}
+	return s
 }
 
 // samplingRestrictedModelFamilies lists the model families whose native

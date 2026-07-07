@@ -7,6 +7,7 @@ package anthropicmessages
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -1215,6 +1216,160 @@ func TestBuildRequestBody_UserToolResultsMerged(t *testing.T) {
 	}
 	if len(content) != 2 {
 		t.Fatalf("expected 2 tool_result blocks, got %d", len(content))
+	}
+}
+
+// TestBuildRequestBody_UserMediaBlocks verifies that user messages carrying
+// inline image data URLs in Media are serialized as Anthropic content-block
+// arrays (text block first, then base64 image blocks), that unusable media
+// entries are skipped, and that messages without media keep the plain-string
+// content form byte-for-byte.
+func TestBuildRequestBody_UserMediaBlocks(t *testing.T) {
+	pngPayload := base64.StdEncoding.EncodeToString([]byte("fake-png-bytes"))
+	jpgPayload := base64.StdEncoding.EncodeToString([]byte("fake-jpg-bytes"))
+	// Base64 string whose decoded length exceeds the 5MB image limit; the
+	// size check uses DecodedLen only, so the content never has to decode.
+	oversizedPayload := strings.Repeat("A", (maxImageBytes/3+1)*4)
+
+	tests := []struct {
+		name        string
+		message     Message
+		wantContent any
+	}{
+		{
+			name: "text plus valid png becomes text block then image block",
+			message: Message{
+				Role:    "user",
+				Content: "What's in this image?",
+				Media:   []string{"data:image/png;base64," + pngPayload},
+			},
+			wantContent: []map[string]any{
+				{"type": "text", "text": "What's in this image?"},
+				{
+					"type": "image",
+					"source": map[string]any{
+						"type":       "base64",
+						"media_type": "image/png",
+						"data":       pngPayload,
+					},
+				},
+			},
+		},
+		{
+			name: "media with empty text emits image block only",
+			message: Message{
+				Role:  "user",
+				Media: []string{"data:image/png;base64," + pngPayload},
+			},
+			wantContent: []map[string]any{
+				{
+					"type": "image",
+					"source": map[string]any{
+						"type":       "base64",
+						"media_type": "image/png",
+						"data":       pngPayload,
+					},
+				},
+			},
+		},
+		{
+			name: "jpg subtype normalizes to image/jpeg",
+			message: Message{
+				Role:  "user",
+				Media: []string{"data:image/jpg;base64," + jpgPayload},
+			},
+			wantContent: []map[string]any{
+				{
+					"type": "image",
+					"source": map[string]any{
+						"type":       "base64",
+						"media_type": "image/jpeg",
+						"data":       jpgPayload,
+					},
+				},
+			},
+		},
+		{
+			name: "invalid entries are skipped while valid ones survive",
+			message: Message{
+				Role:    "user",
+				Content: "mixed",
+				Media: []string{
+					"data:image/tiff;base64," + pngPayload,      // unsupported subtype
+					"data:image/png," + pngPayload,              // missing ;base64 marker
+					"/tmp/foo.png",                              // not a data URL
+					"data:audio/wav;base64," + pngPayload,       // non-image data URL
+					"data:image/png;base64," + oversizedPayload, // exceeds 5MB decoded
+					"data:image/webp;base64," + pngPayload,      // valid
+				},
+			},
+			wantContent: []map[string]any{
+				{"type": "text", "text": "mixed"},
+				{
+					"type": "image",
+					"source": map[string]any{
+						"type":       "base64",
+						"media_type": "image/webp",
+						"data":       pngPayload,
+					},
+				},
+			},
+		},
+		{
+			name: "all media invalid with empty text falls back to plain string",
+			message: Message{
+				Role: "user",
+				Media: []string{
+					"/tmp/foo.png",
+					"data:image/tiff;base64," + pngPayload,
+				},
+			},
+			wantContent: "",
+		},
+		{
+			name: "all media invalid with text keeps the text as a block array",
+			message: Message{
+				Role:    "user",
+				Content: "just words",
+				Media:   []string{"/tmp/foo.png"},
+			},
+			wantContent: []map[string]any{
+				{"type": "text", "text": "just words"},
+			},
+		},
+		{
+			name:        "no media keeps plain string content (regression guard)",
+			message:     Message{Role: "user", Content: "Hello, world!"},
+			wantContent: "Hello, world!",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := buildRequestBody(
+				[]Message{tt.message}, nil, "test-model", map[string]any{"max_tokens": 8192})
+			if err != nil {
+				t.Fatalf("buildRequestBody() error: %v", err)
+			}
+
+			apiMessages, ok := got["messages"].([]any)
+			if !ok {
+				t.Fatalf("messages is not []any")
+			}
+			if len(apiMessages) != 1 {
+				t.Fatalf("expected 1 API message, got %d", len(apiMessages))
+			}
+
+			msg := apiMessages[0].(map[string]any)
+			if msg["role"] != "user" {
+				t.Errorf("role = %v, want user", msg["role"])
+			}
+			if !reflect.DeepEqual(msg["content"], tt.wantContent) {
+				gotJSON, _ := json.MarshalIndent(msg["content"], "", "  ")
+				wantJSON, _ := json.MarshalIndent(tt.wantContent, "", "  ")
+				t.Errorf("content mismatch:\ngot:\n%s\nwant:\n%s", gotJSON, wantJSON)
+			}
+		})
 	}
 }
 
