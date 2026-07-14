@@ -21,9 +21,10 @@ type configuredStreamingProvider struct {
 	chatModels   []string
 	streamModels []string
 
-	chatResponse *providers.LLMResponse
-	streamPlan   []configuredStreamingCall
-	eventPlan    []configuredStreamingEventCall
+	chatResponse         *providers.LLMResponse
+	chatResponsesByModel map[string]*providers.LLMResponse
+	streamPlan           []configuredStreamingCall
+	eventPlan            []configuredStreamingEventCall
 }
 
 type configuredStreamingCall struct {
@@ -47,6 +48,9 @@ func (p *configuredStreamingProvider) Chat(
 ) (*providers.LLMResponse, error) {
 	p.chatCalls++
 	p.chatModels = append(p.chatModels, model)
+	if resp, ok := p.chatResponsesByModel[model]; ok {
+		return resp, nil
+	}
 	if p.chatResponse != nil {
 		return p.chatResponse, nil
 	}
@@ -983,14 +987,18 @@ func TestConfiguredStreamingAfterLLMAbortCancelsPublishedStream(t *testing.T) {
 
 func TestConfiguredStreamingFinalizesWithDefaultResponseWhenContentEmpty(t *testing.T) {
 	cfg := newConfiguredStreamingTestConfig(t, true, true, nil)
+	// A persistently-empty response is retried (empty is recoverable), then
+	// falls back to the default once retries are exhausted. Pin the retry count
+	// and plan an empty response for every attempt so the fallback is reached.
+	cfg.Agents.Defaults.MaxLLMRetries = 1
 	streamer := &recordingStreamer{}
 	msgBus := bus.NewMessageBus()
 	msgBus.SetStreamDelegate(configuredStreamingDelegate{streamer: streamer})
 	provider := &configuredStreamingProvider{
-		streamPlan: []configuredStreamingCall{{
-			chunks:   []string{"partial response"},
-			response: &providers.LLMResponse{},
-		}},
+		streamPlan: []configuredStreamingCall{
+			{chunks: []string{"partial response"}, response: &providers.LLMResponse{}},
+			{response: &providers.LLMResponse{}},
+		},
 	}
 	al := NewAgentLoop(cfg, msgBus, provider)
 
@@ -999,8 +1007,94 @@ func TestConfiguredStreamingFinalizesWithDefaultResponseWhenContentEmpty(t *test
 	if got != defaultResponse {
 		t.Fatalf("response = %q, want default response", got)
 	}
+	if provider.streamCalls != 2 {
+		t.Fatalf("ChatStream calls = %d, want 2 (one empty response retried once)", provider.streamCalls)
+	}
 	if len(streamer.finalized) != 1 || streamer.finalized[0] != defaultResponse {
 		t.Fatalf("stream finalized = %v, want [%q]", streamer.finalized, defaultResponse)
+	}
+}
+
+func TestConfiguredStreamingRetriesEmptyThenSucceeds(t *testing.T) {
+	cfg := newConfiguredStreamingTestConfig(t, true, true, nil)
+	cfg.Agents.Defaults.MaxLLMRetries = 2
+	streamer := &recordingStreamer{}
+	msgBus := bus.NewMessageBus()
+	msgBus.SetStreamDelegate(configuredStreamingDelegate{streamer: streamer})
+	// First attempt is a thinking-only empty response; the retry produces text.
+	provider := &configuredStreamingProvider{
+		streamPlan: []configuredStreamingCall{
+			{response: &providers.LLMResponse{Content: "", ReasoningContent: "quietly thinking"}},
+			{response: &providers.LLMResponse{Content: "recovered answer"}},
+		},
+	}
+	al := NewAgentLoop(cfg, msgBus, provider)
+
+	got := runConfiguredStreamingTurn(t, al, "pico")
+
+	if got != "recovered answer" {
+		t.Fatalf("response = %q, want recovered answer", got)
+	}
+	if provider.streamCalls != 2 {
+		t.Fatalf("ChatStream calls = %d, want 2 (empty response retried once)", provider.streamCalls)
+	}
+}
+
+func TestConfiguredStreamingSurfacesRefusalNotice(t *testing.T) {
+	cfg := newConfiguredStreamingTestConfig(t, true, true, nil)
+	streamer := &recordingStreamer{}
+	msgBus := bus.NewMessageBus()
+	msgBus.SetStreamDelegate(configuredStreamingDelegate{streamer: streamer})
+	// A refusal (empty content, FinishReason "refusal") must NOT be retried and
+	// must surface the honest refusal notice, not the generic empty default.
+	provider := &configuredStreamingProvider{
+		streamPlan: []configuredStreamingCall{
+			{response: &providers.LLMResponse{Content: "", FinishReason: "refusal"}},
+		},
+	}
+	al := NewAgentLoop(cfg, msgBus, provider)
+
+	got := runConfiguredStreamingTurn(t, al, "pico")
+
+	if got != refusalResponse {
+		t.Fatalf("response = %q, want refusal notice %q", got, refusalResponse)
+	}
+	if provider.streamCalls != 1 {
+		t.Fatalf("ChatStream calls = %d, want 1 (refusal is not retried)", provider.streamCalls)
+	}
+}
+
+func TestEmptyResponseEscalatesToFallbackModel(t *testing.T) {
+	// Streaming off + two candidates runs the non-streaming Chat + fallback-chain
+	// path. The primary returns empty on every call; after one same-model retry
+	// the third attempt must escalate to the fallback model, which produces text.
+	cfg := newConfiguredStreamingTestConfig(t, false, false, []string{"fallback-model"})
+	cfg.Agents.Defaults.MaxLLMRetries = 2
+	streamer := &recordingStreamer{}
+	msgBus := bus.NewMessageBus()
+	msgBus.SetStreamDelegate(configuredStreamingDelegate{streamer: streamer})
+	provider := &configuredStreamingProvider{
+		chatResponsesByModel: map[string]*providers.LLMResponse{
+			"openai/test-model":     {Content: ""},
+			"openai/fallback-model": {Content: "recovered by fallback"},
+		},
+	}
+	al := NewAgentLoop(cfg, msgBus, provider)
+
+	got := runConfiguredStreamingTurn(t, al, "pico")
+
+	if got != "recovered by fallback" {
+		t.Fatalf("response = %q, want recovered by fallback", got)
+	}
+	if provider.streamCalls != 0 {
+		t.Fatalf("ChatStream calls = %d, want 0 (multi-candidate disables streaming)", provider.streamCalls)
+	}
+	// Primary tried twice, then escalated to the fallback on the third attempt.
+	if len(provider.chatModels) != 3 {
+		t.Fatalf("chat models = %v, want 3 calls", provider.chatModels)
+	}
+	if provider.chatModels[2] != "openai/fallback-model" {
+		t.Fatalf("third call model = %q, want openai/fallback-model", provider.chatModels[2])
 	}
 }
 

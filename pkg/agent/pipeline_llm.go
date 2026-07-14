@@ -16,6 +16,49 @@ import (
 	"github.com/sipeed/picoclaw/pkg/providers"
 )
 
+// isRecoverableEmptyResponse reports whether a successful LLM response carried
+// neither visible text nor tool calls and was not an explicit refusal — the
+// signature of a thinking-only turn that ended without emitting a text block.
+// These are worth retrying; refusals (a deliberate outcome) and normal
+// responses are not.
+func isRecoverableEmptyResponse(resp *providers.LLMResponse) bool {
+	if resp == nil {
+		return false
+	}
+	if len(resp.ToolCalls) > 0 {
+		return false
+	}
+	if resp.FinishReason == "refusal" {
+		return false
+	}
+	return strings.TrimSpace(resp.Content) == ""
+}
+
+// escalateToFallbackModel drops the leading (just-failed) model candidate so the
+// next attempt runs on the configured fallback model. It also repoints the
+// active provider/model so the single-candidate path is correct if only one
+// candidate remains. Returns the from/to model names and false when there is no
+// fallback to escalate to (leaving the candidate list untouched).
+func (p *Pipeline) escalateToFallbackModel(ts *turnState, exec *turnExecution) (string, string, bool) {
+	if exec == nil || len(exec.activeCandidates) <= 1 {
+		return "", "", false
+	}
+	from := exec.activeCandidates[0]
+	next := exec.activeCandidates[1]
+	provider, err := providerForFallbackCandidate(
+		ts.agent, exec.activeProvider, exec.activeCandidates, next.Provider, next.Model,
+	)
+	if err != nil {
+		return "", "", false
+	}
+	exec.activeCandidates = exec.activeCandidates[1:]
+	exec.activeProvider = provider
+	exec.activeModel = next.Model
+	exec.llmModel = next.Model
+	exec.llmModelName = resolvedCandidateModelName([]providers.FallbackCandidate{next}, exec.llmModelName)
+	return from.Model, next.Model, true
+}
+
 // CallLLM performs an LLM call with fallback support, hook invocation, and retry logic.
 // It handles PreLLM setup, the actual LLM invocation with retry, and AfterLLM processing.
 // Returns Control indicating what the coordinator should do next.
@@ -265,9 +308,58 @@ func (p *Pipeline) CallLLM(
 	if backoffSecs <= 0 {
 		backoffSecs = 2
 	}
+	escalatedEmpty := false
 	for retry := 0; retry <= maxRetries; retry++ {
 		exec.response, err = callLLM(exec.callMessages, exec.providerToolDefs)
 		if err == nil {
+			// Recover from a successful-but-empty response: no text and no tool
+			// calls. Turns that spend their budget on thinking and end without
+			// emitting a text block (common on Claude/Fable with thinking on)
+			// land here. Retry (bounded by maxRetries) — a fresh sample usually
+			// produces text. Retry immediately: unlike a 429/529 this is not a
+			// server-load signal, so a backoff would only add founder-visible
+			// latency. An explicit refusal is NOT retried; it is surfaced with
+			// an honest reason downstream.
+			if retry < maxRetries && isRecoverableEmptyResponse(exec.response) {
+				reason := "empty_response"
+				// If the same model has come back empty on a retry, escalate the
+				// remaining attempts to the configured fallback model. An empty
+				// response is HTTP 200, so the fallback chain (which only advances
+				// on classified errors) never switches on its own — a persistently
+				// thinking-only primary would otherwise loop until the default.
+				if retry >= 1 && !escalatedEmpty {
+					if from, to, ok := p.escalateToFallbackModel(ts, exec); ok {
+						escalatedEmpty = true
+						reason = "empty_response_model_escalation"
+						logger.WarnCF("agent", "Empty responses persist; escalating to fallback model", map[string]any{
+							"agent_id":  ts.agent.ID,
+							"iteration": iteration,
+							"from":      from,
+							"to":        to,
+						})
+					}
+				}
+				al.emitEvent(
+					runtimeevents.KindAgentLLMRetry,
+					ts.eventMeta("runTurn", "turn.llm.retry"),
+					LLMRetryPayload{
+						Attempt:    retry + 1,
+						MaxRetries: maxRetries,
+						Reason:     reason,
+					},
+				)
+				logger.WarnCF("agent", "Empty LLM response (no content, no tool calls), retrying", map[string]any{
+					"agent_id":      ts.agent.ID,
+					"iteration":     iteration,
+					"finish_reason": exec.response.FinishReason,
+					"retry":         retry,
+				})
+				if ts.hardAbortRequested() {
+					_ = ts.requestHardAbort()
+					return ControlBreak, nil
+				}
+				continue
+			}
 			break
 		}
 		if ts.hardAbortRequested() && errors.Is(err, context.Canceled) {
@@ -570,8 +662,15 @@ func (p *Pipeline) CallLLM(
 	// No-tool-call path: steering check and direct response
 	if len(exec.response.ToolCalls) == 0 || exec.gracefulTerminal {
 		responseContent := exec.response.Content
-		if responseContent == "" && exec.response.ReasoningContent != "" && ts.channel != "pico" {
-			responseContent = exec.response.ReasoningContent
+		if responseContent == "" {
+			switch {
+			case exec.response.FinishReason == "refusal":
+				// Report the decline honestly instead of the generic empty-response
+				// default (which reads as a provider/token error).
+				responseContent = refusalResponse
+			case exec.response.ReasoningContent != "" && ts.channel != "pico":
+				responseContent = exec.response.ReasoningContent
+			}
 		}
 		if steerMsgs := al.dequeueSteeringMessagesForScope(ts.sessionKey); len(steerMsgs) > 0 {
 			cancelConfiguredStreamingLLM(turnCtx, exec)

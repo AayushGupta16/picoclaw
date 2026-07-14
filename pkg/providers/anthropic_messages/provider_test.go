@@ -915,6 +915,61 @@ func TestParseResponseBody(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "refusal stop reason",
+			body: []byte(`{
+				"id": "msg-refusal",
+				"type": "message",
+				"role": "assistant",
+				"content": [],
+				"stop_reason": "refusal",
+				"model": "test-model",
+				"usage": {
+					"input_tokens": 30,
+					"output_tokens": 3
+				}
+			}`),
+			want: &LLMResponse{
+				Content:      "",
+				ToolCalls:    []ToolCall{},
+				FinishReason: "refusal",
+				Usage: &UsageInfo{
+					PromptTokens:     30,
+					CompletionTokens: 3,
+					TotalTokens:      33,
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "thinking-only response captures reasoning",
+			body: []byte(`{
+				"id": "msg-thinking",
+				"type": "message",
+				"role": "assistant",
+				"content": [
+					{"type": "thinking", "thinking": "Let me reason about this quietly."}
+				],
+				"stop_reason": "end_turn",
+				"model": "test-model",
+				"usage": {
+					"input_tokens": 40,
+					"output_tokens": 1166
+				}
+			}`),
+			want: &LLMResponse{
+				Content:          "",
+				ReasoningContent: "Let me reason about this quietly.",
+				ToolCalls:        []ToolCall{},
+				FinishReason:     "stop",
+				Usage: &UsageInfo{
+					PromptTokens:     40,
+					CompletionTokens: 1166,
+					TotalTokens:      1206,
+				},
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -934,6 +989,9 @@ func TestParseResponseBody(t *testing.T) {
 			}
 			if got.FinishReason != tt.want.FinishReason {
 				t.Errorf("FinishReason = %q, want %q", got.FinishReason, tt.want.FinishReason)
+			}
+			if got.ReasoningContent != tt.want.ReasoningContent {
+				t.Errorf("ReasoningContent = %q, want %q", got.ReasoningContent, tt.want.ReasoningContent)
 			}
 			if got.Usage == nil && tt.want.Usage != nil {
 				t.Errorf("Usage = nil, want non-nil")

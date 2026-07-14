@@ -631,14 +631,22 @@ func parseResponseBody(body []byte) (*LLMResponse, error) {
 		return nil, fmt.Errorf("parsing JSON response: %w", err)
 	}
 
-	// Extract content and tool calls
+	// Extract content, reasoning, and tool calls
 	var content strings.Builder
+	var reasoning strings.Builder
 	toolCalls := make([]ToolCall, 0) // Initialize as empty slice (not nil) for consistent JSON serialization
 
 	for _, block := range resp.Content {
 		switch block.Type {
 		case "text":
 			content.WriteString(block.Text)
+		case "thinking":
+			// Extended-thinking blocks carry the model's reasoning. Capture
+			// them so a thinking-only turn — a text-less response ending with
+			// end_turn, common on Claude/Fable models with thinking on — is
+			// recognized as reasoning-only rather than silently dropped and
+			// misreported downstream as an empty response.
+			reasoning.WriteString(block.Thinking)
 		case "tool_use":
 			argsJSON, _ := json.Marshal(block.Input)
 			toolCalls = append(toolCalls, ToolCall{
@@ -664,12 +672,18 @@ func parseResponseBody(body []byte) (*LLMResponse, error) {
 		finishReason = "stop"
 	case "stop_sequence":
 		finishReason = "stop"
+	case "refusal":
+		// The model declined for policy reasons (HTTP 200, typically empty
+		// content). Surface it distinctly so the turn reports an honest reason
+		// instead of a generic "empty response".
+		finishReason = "refusal"
 	}
 
 	return &LLMResponse{
-		Content:      content.String(),
-		ToolCalls:    toolCalls,
-		FinishReason: finishReason,
+		Content:          content.String(),
+		ReasoningContent: reasoning.String(),
+		ToolCalls:        toolCalls,
+		FinishReason:     finishReason,
 		Usage: &UsageInfo{
 			PromptTokens:             int(resp.Usage.InputTokens),
 			CompletionTokens:         int(resp.Usage.OutputTokens),
@@ -693,11 +707,12 @@ type anthropicMessageResponse struct {
 }
 
 type contentBlock struct {
-	Type  string         `json:"type"`
-	Text  string         `json:"text,omitempty"`
-	ID    string         `json:"id,omitempty"`
-	Name  string         `json:"name,omitempty"`
-	Input map[string]any `json:"input,omitempty"`
+	Type     string         `json:"type"`
+	Text     string         `json:"text,omitempty"`
+	Thinking string         `json:"thinking,omitempty"`
+	ID       string         `json:"id,omitempty"`
+	Name     string         `json:"name,omitempty"`
+	Input    map[string]any `json:"input,omitempty"`
 }
 
 type usageInfo struct {
