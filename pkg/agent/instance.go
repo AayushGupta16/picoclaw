@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/isolation"
@@ -59,6 +61,24 @@ type AgentInstance struct {
 	// instances. This allows each fallback model to use its own api_base and api_key
 	// from model_list, instead of inheriting the primary model's provider config.
 	CandidateProviders map[string]providers.LLMProvider
+
+	// RefusalFailoverCandidates holds the resolved candidates for the configured
+	// refusal failover model. Empty when refusal_failover is not configured —
+	// every hold/failover code path gates on this being non-empty.
+	RefusalFailoverCandidates []providers.FallbackCandidate
+
+	// refusalHold marks the refusal failover model as the turn-start model
+	// until the stored instant. Held behind a pointer so the shallow agent
+	// copies made for SubTurns share one hold with the registry instance.
+	// In-memory by design: a gateway restart clears the hold, and the next
+	// refusal from the primary simply re-arms it.
+	refusalHold *refusalHoldState
+}
+
+// refusalHoldState tracks the refusal failover hold window.
+type refusalHoldState struct {
+	mu    sync.Mutex
+	until time.Time
 }
 
 // NewAgentInstance creates an agent instance from config.
@@ -253,6 +273,21 @@ func NewAgentInstance(
 		}
 	}
 
+	// Refusal failover setup: pre-resolve the failover model at creation time,
+	// like the light model above. Provider registration is best-effort — without
+	// a usable model_list entry the failover call inherits the active provider,
+	// matching normal fallback-candidate behavior.
+	var refusalFailoverCandidates []providers.FallbackCandidate
+	if rf := defaults.RefusalFailover; rf != nil && strings.TrimSpace(rf.Model) != "" {
+		refusalFailoverCandidates = resolveModelCandidates(cfg, defaults.Provider, rf.Model, nil)
+		if len(refusalFailoverCandidates) > 0 {
+			populateCandidateProvidersFromNames(cfg, workspace, []string{rf.Model}, candidateProviders)
+		} else {
+			logger.WarnCF("agent", "Refusal failover model not found; refusal failover disabled",
+				map[string]any{"failover_model": rf.Model, "agent_id": agentID})
+		}
+	}
+
 	return &AgentInstance{
 		ID:                        agentID,
 		Name:                      agentName,
@@ -281,6 +316,8 @@ func NewAgentInstance(
 		LightCandidates:           lightCandidates,
 		LightProvider:             lightProvider,
 		CandidateProviders:        candidateProviders,
+		RefusalFailoverCandidates: refusalFailoverCandidates,
+		refusalHold:               &refusalHoldState{},
 	}
 }
 
@@ -410,6 +447,27 @@ func resolveAgentSkillsFilter(
 		return nil
 	}
 	return append([]string(nil), agentCfg.Skills...)
+}
+
+// ArmRefusalHold makes the refusal failover model the turn-start model for the
+// next holdFor. Later arms extend the hold; non-positive durations are ignored.
+func (a *AgentInstance) ArmRefusalHold(holdFor time.Duration) {
+	if a == nil || a.refusalHold == nil || holdFor <= 0 {
+		return
+	}
+	a.refusalHold.mu.Lock()
+	defer a.refusalHold.mu.Unlock()
+	a.refusalHold.until = time.Now().Add(holdFor)
+}
+
+// RefusalHoldUntil returns the hold expiry and whether the hold is active.
+func (a *AgentInstance) RefusalHoldUntil() (time.Time, bool) {
+	if a == nil || a.refusalHold == nil {
+		return time.Time{}, false
+	}
+	a.refusalHold.mu.Lock()
+	defer a.refusalHold.mu.Unlock()
+	return a.refusalHold.until, time.Now().Before(a.refusalHold.until)
 }
 
 func (a *AgentInstance) AllowsMCPServer(serverName string) bool {

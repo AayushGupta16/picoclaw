@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"gopkg.in/yaml.v3"
@@ -1415,6 +1416,64 @@ func TestLoadConfig_WebPreferNativeCanBeDisabled(t *testing.T) {
 	}
 	if cfg.Tools.Web.PreferNative {
 		t.Fatal("PreferNative should be false when disabled in config file")
+	}
+}
+
+func TestLoadConfig_RefusalFailoverParses(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	raw := `{"version":1,"agents":{"defaults":{"workspace":"./workspace",` +
+		`"refusal_failover":{"model":"failover-model","hold_minutes":120}}}}`
+	if err := os.WriteFile(configPath, []byte(raw), 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error: %v", err)
+	}
+	rf := cfg.Agents.Defaults.RefusalFailover
+	if rf == nil {
+		t.Fatal("agents.defaults.refusal_failover should parse to a non-nil config")
+	}
+	if rf.Model != "failover-model" {
+		t.Fatalf("refusal_failover.model = %q, want failover-model", rf.Model)
+	}
+	if got, want := rf.HoldDuration(), 120*time.Minute; got != want {
+		t.Fatalf("HoldDuration() = %v, want %v", got, want)
+	}
+}
+
+func TestLoadConfig_RefusalFailoverDefaultsNilWhenUnset(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(
+		configPath,
+		[]byte(`{"version":1,"agents":{"defaults":{"workspace":"./workspace"}}}`),
+		0o600,
+	); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error: %v", err)
+	}
+	if cfg.Agents.Defaults.RefusalFailover != nil {
+		t.Fatal("agents.defaults.refusal_failover should remain nil when unset in config file")
+	}
+}
+
+func TestRefusalFailoverConfig_HoldDurationDefaults(t *testing.T) {
+	var nilCfg *RefusalFailoverConfig
+	if got, want := nilCfg.HoldDuration(), 360*time.Minute; got != want {
+		t.Fatalf("nil HoldDuration() = %v, want %v", got, want)
+	}
+	if got, want := (&RefusalFailoverConfig{Model: "failover-model"}).HoldDuration(), 360*time.Minute; got != want {
+		t.Fatalf("unset HoldDuration() = %v, want %v", got, want)
+	}
+	if got, want := (&RefusalFailoverConfig{HoldMinutes: -5}).HoldDuration(), 360*time.Minute; got != want {
+		t.Fatalf("negative HoldDuration() = %v, want %v", got, want)
 	}
 }
 

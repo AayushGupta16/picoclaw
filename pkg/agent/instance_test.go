@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/media"
@@ -897,5 +898,101 @@ func TestNewAgentInstance_ExplicitEmptyToolsFieldBlocksAllTools(t *testing.T) {
 				t.Fatal("expected list_dir to be blocked by explicit empty tools field")
 			}
 		})
+	}
+}
+
+func TestNewAgentInstance_ResolvesRefusalFailoverCandidates(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace: tmpDir,
+				ModelName: "test-model",
+				RefusalFailover: &config.RefusalFailoverConfig{
+					Model: "failover-model",
+				},
+			},
+		},
+		ModelList: []*config.ModelConfig{
+			{
+				ModelName: "test-model",
+				Provider:  "openai",
+				Model:     "openai/test-model",
+			},
+			{
+				ModelName: "failover-model",
+				Provider:  "openai",
+				Model:     "openai/failover-model",
+			},
+		},
+	}
+
+	agent := NewAgentInstance(nil, &cfg.Agents.Defaults, cfg, &mockProvider{})
+
+	if len(agent.RefusalFailoverCandidates) != 1 {
+		t.Fatalf("len(RefusalFailoverCandidates) = %d, want 1", len(agent.RefusalFailoverCandidates))
+	}
+	if got := agent.RefusalFailoverCandidates[0].Model; got != "openai/failover-model" {
+		t.Fatalf("failover candidate model = %q, want openai/failover-model", got)
+	}
+}
+
+func TestNewAgentInstance_RefusalFailoverUnconfiguredResolvesNoCandidates(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace: tmpDir,
+				ModelName: "test-model",
+			},
+		},
+		ModelList: []*config.ModelConfig{{
+			ModelName: "test-model",
+			Provider:  "openai",
+			Model:     "openai/test-model",
+		}},
+	}
+
+	agent := NewAgentInstance(nil, &cfg.Agents.Defaults, cfg, &mockProvider{})
+
+	if len(agent.RefusalFailoverCandidates) != 0 {
+		t.Fatalf(
+			"RefusalFailoverCandidates = %v, want none when refusal_failover is unset",
+			agent.RefusalFailoverCandidates,
+		)
+	}
+	if _, active := agent.RefusalHoldUntil(); active {
+		t.Fatal("new instance should have no active refusal hold")
+	}
+}
+
+func TestArmRefusalHoldAndRefusalHoldUntil(t *testing.T) {
+	agent := &AgentInstance{refusalHold: &refusalHoldState{}}
+
+	if _, active := agent.RefusalHoldUntil(); active {
+		t.Fatal("unarmed hold should read inactive")
+	}
+
+	agent.ArmRefusalHold(time.Hour)
+	until, active := agent.RefusalHoldUntil()
+	if !active {
+		t.Fatal("hold should be active after arming")
+	}
+	if remaining := time.Until(until); remaining <= 55*time.Minute || remaining > time.Hour {
+		t.Fatalf("hold remaining = %v, want ~1h", remaining)
+	}
+
+	agent.ArmRefusalHold(0)
+	if _, stillActive := agent.RefusalHoldUntil(); !stillActive {
+		t.Fatal("non-positive arm should not clear an active hold")
+	}
+
+	agent.refusalHold.mu.Lock()
+	agent.refusalHold.until = time.Now().Add(-time.Second)
+	agent.refusalHold.mu.Unlock()
+	if _, active := agent.RefusalHoldUntil(); active {
+		t.Fatal("expired hold should read inactive")
 	}
 }

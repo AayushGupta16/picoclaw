@@ -34,6 +34,60 @@ func isRecoverableEmptyResponse(resp *providers.LLMResponse) bool {
 	return strings.TrimSpace(resp.Content) == ""
 }
 
+// refusalFailoverEligible reports whether a refusal should re-run on the
+// configured refusal failover model: an explicit refusal with no tool calls,
+// a failover model resolved on the agent, and the refusing model is not the
+// failover model itself (a refusal there surfaces as-is — no failover loop).
+func refusalFailoverEligible(agent *AgentInstance, resp *providers.LLMResponse, activeModel string) bool {
+	if resp == nil || resp.FinishReason != "refusal" || len(resp.ToolCalls) > 0 {
+		return false
+	}
+	if agent == nil || len(agent.RefusalFailoverCandidates) == 0 {
+		return false
+	}
+	return activeModel != agent.RefusalFailoverCandidates[0].Model
+}
+
+// repointExecToCandidate switches the exec's candidate list, provider, and
+// model to the given candidate so the next attempt runs on it, keeping the
+// single-candidate path (which sends exec.llmOpts directly) correct. Thinking
+// options are recomputed for the new candidate's model config — the previous
+// model's thinking options must not be sent to a provider family that rejects
+// them. Mirrors the per-candidate setup in runCandidate. Returns false when
+// the candidate's provider cannot be resolved (leaving the exec untouched).
+func (p *Pipeline) repointExecToCandidate(
+	ts *turnState,
+	exec *turnExecution,
+	next providers.FallbackCandidate,
+	candidates []providers.FallbackCandidate,
+) bool {
+	provider, err := providerForFallbackCandidate(
+		ts.agent, exec.activeProvider, exec.activeCandidates, next.Provider, next.Model,
+	)
+	if err != nil {
+		return false
+	}
+	exec.activeCandidates = candidates
+	exec.activeProvider = provider
+	exec.activeModel = next.Model
+	exec.llmModel = next.Model
+	exec.llmModelName = resolvedCandidateModelName([]providers.FallbackCandidate{next}, exec.llmModelName)
+	exec.activeModelConfig = resolveActiveModelConfig(
+		p.Cfg,
+		ts.agent.Workspace,
+		[]providers.FallbackCandidate{next},
+		next.Model,
+		p.Cfg.Agents.Defaults.Provider,
+	)
+	if exec.llmOpts != nil {
+		delete(exec.llmOpts, "thinking_level")
+		nextThinking := thinkingSettingsFromModelConfig(exec.activeModelConfig)
+		applyThinkingOption(exec.llmOpts, provider, nextThinking, true, ts.agent.ID)
+		exec.suppressReasoning = shouldSuppressReasoningFor(nextThinking)
+	}
+	return true
+}
+
 // escalateToFallbackModel drops the leading (just-failed) model candidate so the
 // next attempt runs on the configured fallback model. It also repoints the
 // active provider/model so the single-candidate path is correct if only one
@@ -45,18 +99,35 @@ func (p *Pipeline) escalateToFallbackModel(ts *turnState, exec *turnExecution) (
 	}
 	from := exec.activeCandidates[0]
 	next := exec.activeCandidates[1]
-	provider, err := providerForFallbackCandidate(
-		ts.agent, exec.activeProvider, exec.activeCandidates, next.Provider, next.Model,
-	)
-	if err != nil {
+	if !p.repointExecToCandidate(ts, exec, next, exec.activeCandidates[1:]) {
 		return "", "", false
 	}
-	exec.activeCandidates = exec.activeCandidates[1:]
-	exec.activeProvider = provider
-	exec.activeModel = next.Model
-	exec.llmModel = next.Model
-	exec.llmModelName = resolvedCandidateModelName([]providers.FallbackCandidate{next}, exec.llmModelName)
 	return from.Model, next.Model, true
+}
+
+// switchToRefusalFailover fronts the refusal failover candidate so the next
+// attempt runs on it. The refusing lead candidate is dropped; the remaining
+// fallbacks stay behind the failover model (mirrors turn-start hold selection).
+// Returns the from/to model names and false when the exec could not be
+// repointed.
+func (p *Pipeline) switchToRefusalFailover(ts *turnState, exec *turnExecution) (string, string, bool) {
+	if exec == nil || ts == nil || ts.agent == nil || len(ts.agent.RefusalFailoverCandidates) == 0 {
+		return "", "", false
+	}
+	next := ts.agent.RefusalFailoverCandidates[0]
+	candidates := make([]providers.FallbackCandidate, 0, len(exec.activeCandidates)+1)
+	candidates = append(candidates, next)
+	for i, candidate := range exec.activeCandidates {
+		if i == 0 || candidate.StableKey() == next.StableKey() {
+			continue
+		}
+		candidates = append(candidates, candidate)
+	}
+	from := exec.activeModel
+	if !p.repointExecToCandidate(ts, exec, next, candidates) {
+		return "", "", false
+	}
+	return from, next.Model, true
 }
 
 // CallLLM performs an LLM call with fallback support, hook invocation, and retry logic.
@@ -359,6 +430,42 @@ func (p *Pipeline) CallLLM(
 					return ControlBreak, nil
 				}
 				continue
+			}
+			// A refusal is terminal for the refusing model — retrying it re-runs
+			// the same classifier. When a failover model is configured, re-run
+			// the call there and arm the hold so subsequent turns start on it.
+			// Arm even with the retry budget exhausted: this turn dies, but the
+			// next ones skip the refusing primary. Retry immediately — a refusal
+			// is not a load signal. A refusal from the failover model itself is
+			// not eligible and surfaces downstream unchanged.
+			if refusalFailoverEligible(ts.agent, exec.response, exec.activeModel) {
+				ts.agent.ArmRefusalHold(p.Cfg.Agents.Defaults.RefusalFailover.HoldDuration())
+				if retry < maxRetries {
+					if from, to, ok := p.switchToRefusalFailover(ts, exec); ok {
+						holdUntil, _ := ts.agent.RefusalHoldUntil()
+						al.emitEvent(
+							runtimeevents.KindAgentLLMRetry,
+							ts.eventMeta("runTurn", "turn.llm.retry"),
+							LLMRetryPayload{
+								Attempt:    retry + 1,
+								MaxRetries: maxRetries,
+								Reason:     "refusal_model_failover",
+							},
+						)
+						logger.WarnCF("agent", "Model refused; failing over to refusal failover model", map[string]any{
+							"agent_id":   ts.agent.ID,
+							"iteration":  iteration,
+							"from":       from,
+							"to":         to,
+							"hold_until": holdUntil.Format(time.RFC3339),
+						})
+						if ts.hardAbortRequested() {
+							_ = ts.requestHardAbort()
+							return ControlBreak, nil
+						}
+						continue
+					}
+				}
 			}
 			break
 		}

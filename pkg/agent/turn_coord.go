@@ -309,7 +309,8 @@ func (al *AgentLoop) selectCandidates(
 	history []providers.Message,
 ) (candidates []providers.FallbackCandidate, model string, usedLight bool) {
 	if agent.Router == nil || len(agent.LightCandidates) == 0 {
-		return agent.Candidates, resolvedCandidateModel(agent.Candidates, agent.Model), false
+		candidates, model = refusalHoldSelection(agent, agent.Candidates, resolvedCandidateModel(agent.Candidates, agent.Model))
+		return candidates, model, false
 	}
 
 	_, usedLight, score := agent.Router.SelectModel(userMsg, history, agent.Model)
@@ -320,7 +321,8 @@ func (al *AgentLoop) selectCandidates(
 				"score":     score,
 				"threshold": agent.Router.Threshold(),
 			})
-		return agent.Candidates, resolvedCandidateModel(agent.Candidates, agent.Model), false
+		candidates, model = refusalHoldSelection(agent, agent.Candidates, resolvedCandidateModel(agent.Candidates, agent.Model))
+		return candidates, model, false
 	}
 
 	logger.InfoCF("agent", "Model routing: light model selected",
@@ -331,6 +333,52 @@ func (al *AgentLoop) selectCandidates(
 			"threshold":   agent.Router.Threshold(),
 		})
 	return agent.LightCandidates, resolvedCandidateModel(agent.LightCandidates, agent.Router.LightModel()), true
+}
+
+// refusalHoldSelection fronts the refusal failover model while the agent's
+// refusal hold is armed, so turns skip a primary that is currently refusing.
+// The primary (Candidates[0]) is dropped for the window; the remaining
+// fallbacks stay behind the failover model. Pass-through when refusal failover
+// is not configured or the hold is inactive.
+func refusalHoldSelection(
+	agent *AgentInstance,
+	candidates []providers.FallbackCandidate,
+	model string,
+) ([]providers.FallbackCandidate, string) {
+	if agent == nil || len(agent.RefusalFailoverCandidates) == 0 {
+		return candidates, model
+	}
+	holdUntil, active := agent.RefusalHoldUntil()
+	if !active {
+		return candidates, model
+	}
+	failover := agent.RefusalFailoverCandidates[0]
+	fronted := make([]providers.FallbackCandidate, 0, len(candidates))
+	fronted = append(fronted, failover)
+	for i, candidate := range candidates {
+		if i == 0 || candidate.StableKey() == failover.StableKey() {
+			continue
+		}
+		fronted = append(fronted, candidate)
+	}
+	logger.InfoCF("agent", "Refusal hold active; starting turn on failover model",
+		map[string]any{
+			"agent_id":       agent.ID,
+			"failover_model": failover.Model,
+			"hold_until":     holdUntil.Format(time.RFC3339),
+		})
+	return fronted, failover.Model
+}
+
+// refusalFailoverFronted reports whether turn-start selection fronted the
+// refusal failover model. Detected by candidate identity rather than by
+// re-checking the clock, so the provider choice always matches the candidate
+// list actually selected.
+func refusalFailoverFronted(agent *AgentInstance, candidates []providers.FallbackCandidate) bool {
+	if agent == nil || len(agent.RefusalFailoverCandidates) == 0 || len(candidates) == 0 {
+		return false
+	}
+	return candidates[0].StableKey() == agent.RefusalFailoverCandidates[0].StableKey()
 }
 
 func (al *AgentLoop) resolveContextManager() ContextManager {

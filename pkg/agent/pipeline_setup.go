@@ -132,6 +132,16 @@ func (p *Pipeline) SetupTurn(ctx context.Context, ts *turnState) (*turnExecution
 	if usedLight && ts.agent.LightProvider != nil {
 		activeProvider = ts.agent.LightProvider
 	}
+	// A hold-fronted refusal failover model needs its own provider on the
+	// single-candidate path; multi-candidate calls resolve providers per
+	// candidate on their own.
+	if !usedLight && refusalFailoverFronted(ts.agent, activeCandidates) {
+		if provider, err := providerForFallbackCandidate(
+			ts.agent, activeProvider, activeCandidates, activeCandidates[0].Provider, activeCandidates[0].Model,
+		); err == nil {
+			activeProvider = provider
+		}
+	}
 	activeModelName := strings.TrimSpace(ts.agent.Model)
 	if usedLight {
 		activeModelName = strings.TrimSpace(sideQuestionModelName(ts.agent, true))
