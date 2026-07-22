@@ -175,14 +175,20 @@ func (p *Provider) Chat(
 		requestBody.MaxOutputTokens = openai.Opt(int64(maxTokens))
 	}
 
-	if temperature, ok := common.AsFloat(options["temperature"]); ok {
-		requestBody.Temperature = openai.Opt(temperature)
-	}
-
+	reasoningApplied := false
 	if level, ok := options["thinking_level"].(string); ok {
 		if effort, mapped := reasoningEffortForThinkingLevel(level); mapped {
 			requestBody.Reasoning = shared.ReasoningParam{Effort: effort}
+			reasoningApplied = true
 		}
+	}
+
+	// Reasoning requests reject sampling parameters: OpenAI 400s any
+	// non-default temperature on reasoning models ("'temperature' is not
+	// supported with this model"), and the agent loop always sends one
+	// (default 0.7). Only forward temperature on non-reasoning requests.
+	if temperature, ok := common.AsFloat(options["temperature"]); ok && !reasoningApplied {
+		requestBody.Temperature = openai.Opt(temperature)
 	}
 
 	if cacheKey, ok := options["prompt_cache_key"].(string); ok && cacheKey != "" {

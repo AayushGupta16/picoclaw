@@ -207,6 +207,41 @@ func TestProviderSupportsThinking(t *testing.T) {
 	}
 }
 
+func TestProviderChat_ReasoningSuppressesTemperature(t *testing.T) {
+	cases := []struct {
+		level    string
+		wantTemp bool
+	}{
+		{"high", false},
+		{"off", false},
+		{"adaptive", true}, // unmapped: no reasoning param, temperature passes through
+		{"", true},
+	}
+	for _, tc := range cases {
+		var requestBody map[string]any
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewDecoder(r.Body).Decode(&requestBody)
+			writeValidResponse(w)
+		}))
+
+		opts := map[string]any{"temperature": 0.7}
+		if tc.level != "" {
+			opts["thinking_level"] = tc.level
+		}
+		p := NewProvider("test-key", server.URL, "", "")
+		_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "deployment", opts)
+		server.Close()
+		if err != nil {
+			t.Fatalf("Chat(thinking_level=%q) error = %v", tc.level, err)
+		}
+
+		_, present := requestBody["temperature"]
+		if present != tc.wantTemp {
+			t.Errorf("thinking_level=%q: temperature present = %v, want %v", tc.level, present, tc.wantTemp)
+		}
+	}
+}
+
 func TestProviderChat_AzureStoreIsFalse(t *testing.T) {
 	var requestBody map[string]any
 
