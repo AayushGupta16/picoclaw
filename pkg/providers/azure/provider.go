@@ -12,6 +12,7 @@ import (
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/responses"
+	"github.com/openai/openai-go/v3/shared"
 
 	"github.com/sipeed/picoclaw/pkg/providers/common"
 	orc "github.com/sipeed/picoclaw/pkg/providers/openai_responses_common"
@@ -33,11 +34,12 @@ const (
 // It handles Azure-specific authentication (Bearer token), URL construction
 // (Responses API), and request/response formatting.
 type Provider struct {
-	apiKey      string
-	apiBase     string
-	httpClient  *http.Client
-	userAgent   string
-	tokenSource func(ctx context.Context) (string, error)
+	apiKey        string
+	apiBase       string
+	responsesPath string
+	httpClient    *http.Client
+	userAgent     string
+	tokenSource   func(ctx context.Context) (string, error)
 }
 
 // Option configures the Azure Provider.
@@ -67,13 +69,24 @@ func WithTokenSource(ts func(ctx context.Context) (string, error)) Option {
 	}
 }
 
+// WithResponsesAPIPath overrides the Responses API path joined onto api_base.
+// Azure uses "openai/v1/responses"; direct OpenAI uses "v1/responses".
+func WithResponsesAPIPath(path string) Option {
+	return func(p *Provider) {
+		if path != "" {
+			p.responsesPath = path
+		}
+	}
+}
+
 // NewProvider creates a new Azure OpenAI provider.
 func NewProvider(apiKey, apiBase, proxy, userAgent string, opts ...Option) *Provider {
 	p := &Provider{
-		apiKey:     apiKey,
-		apiBase:    strings.TrimRight(apiBase, "/"),
-		userAgent:  userAgent,
-		httpClient: common.NewHTTPClient(proxy),
+		apiKey:        apiKey,
+		apiBase:       strings.TrimRight(apiBase, "/"),
+		responsesPath: responsesAPIPath,
+		userAgent:     userAgent,
+		httpClient:    common.NewHTTPClient(proxy),
 	}
 
 	for _, opt := range opts {
@@ -102,10 +115,11 @@ func NewProviderWithTokenSource(
 	opts ...Option,
 ) *Provider {
 	p := &Provider{
-		apiBase:     strings.TrimRight(apiBase, "/"),
-		userAgent:   userAgent,
-		httpClient:  common.NewHTTPClient(proxy),
-		tokenSource: tokenSource,
+		apiBase:       strings.TrimRight(apiBase, "/"),
+		responsesPath: responsesAPIPath,
+		userAgent:     userAgent,
+		httpClient:    common.NewHTTPClient(proxy),
+		tokenSource:   tokenSource,
 	}
 
 	for _, opt := range opts {
@@ -130,7 +144,7 @@ func (p *Provider) Chat(
 		return nil, fmt.Errorf("Azure API base not configured")
 	}
 
-	requestURL, err := url.JoinPath(p.apiBase, responsesAPIPath)
+	requestURL, err := url.JoinPath(p.apiBase, p.responsesPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build Azure request URL: %w", err)
 	}
@@ -163,6 +177,12 @@ func (p *Provider) Chat(
 
 	if temperature, ok := common.AsFloat(options["temperature"]); ok {
 		requestBody.Temperature = openai.Opt(temperature)
+	}
+
+	if level, ok := options["thinking_level"].(string); ok {
+		if effort, mapped := reasoningEffortForThinkingLevel(level); mapped {
+			requestBody.Reasoning = shared.ReasoningParam{Effort: effort}
+		}
 	}
 
 	if cacheKey, ok := options["prompt_cache_key"].(string); ok && cacheKey != "" {
@@ -210,4 +230,31 @@ func (p *Provider) Chat(
 // GetDefaultModel returns an empty string as Azure deployments are user-configured.
 func (p *Provider) GetDefaultModel() string {
 	return ""
+}
+
+// SupportsThinking reports that this provider can apply thinking_level: the
+// Responses API takes a first-class reasoning.effort parameter. Without this,
+// the agent loop strips thinking_level from the options before Chat is called.
+func (p *Provider) SupportsThinking() bool {
+	return true
+}
+
+// reasoningEffortForThinkingLevel maps picoclaw thinking levels onto Responses
+// API reasoning efforts. "adaptive" (and anything unrecognized) reports
+// unmapped so the API's own default effort applies.
+func reasoningEffortForThinkingLevel(level string) (shared.ReasoningEffort, bool) {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "off":
+		return shared.ReasoningEffortNone, true
+	case "low":
+		return shared.ReasoningEffortLow, true
+	case "medium":
+		return shared.ReasoningEffortMedium, true
+	case "high":
+		return shared.ReasoningEffortHigh, true
+	case "xhigh":
+		return shared.ReasoningEffortXhigh, true
+	default:
+		return "", false
+	}
 }

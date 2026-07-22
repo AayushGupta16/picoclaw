@@ -195,6 +195,42 @@ func TestCreateProviderFromConfig_DeepSeekSupportsThinking(t *testing.T) {
 	}
 }
 
+func TestCreateProviderFromConfig_OpenAIResponses(t *testing.T) {
+	cfg := &config.ModelConfig{
+		ModelName: "gpt-5-6-sol",
+		Provider:  "openai-responses",
+		Model:     "gpt-5.6-sol",
+	}
+	cfg.SetAPIKey("test-key")
+
+	provider, modelID, err := CreateProviderFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateProviderFromConfig() error = %v", err)
+	}
+	if modelID != "gpt-5.6-sol" {
+		t.Fatalf("modelID = %q, want %q", modelID, "gpt-5.6-sol")
+	}
+	tc, ok := provider.(ThinkingCapable)
+	if !ok {
+		t.Fatalf("provider %T should implement ThinkingCapable", provider)
+	}
+	if !tc.SupportsThinking() {
+		t.Fatal("openai-responses provider SupportsThinking() = false, want true")
+	}
+}
+
+func TestCreateProviderFromConfig_OpenAIResponsesRequiresAPIKey(t *testing.T) {
+	cfg := &config.ModelConfig{
+		ModelName: "gpt-5-6-sol",
+		Provider:  "openai-responses",
+		Model:     "gpt-5.6-sol",
+	}
+
+	if _, _, err := CreateProviderFromConfig(cfg); err == nil {
+		t.Fatal("CreateProviderFromConfig() error = nil, want api_key error")
+	}
+}
+
 func TestCreateProviderFromConfig_PreservesExplicitProviderPrefixedModel(t *testing.T) {
 	cfg := &config.ModelConfig{
 		ModelName: "test-openai",

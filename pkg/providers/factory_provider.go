@@ -136,6 +136,30 @@ func CreateProviderFromConfig(cfg *config.ModelConfig) (LLMProvider, string, err
 		provider.SetProviderName(protocol)
 		return finalizeProviderFromConfig(provider, modelID, cfg)
 
+	case "openai-responses":
+		// Direct OpenAI over the Responses API (/v1/responses). Chat
+		// Completions rejects function tools combined with a nonzero
+		// reasoning_effort on some models (e.g. gpt-5.6-sol); the Responses
+		// API is OpenAI's sanctioned path for tool use with thinking. Reuses
+		// the Azure provider's Responses implementation with the OpenAI path
+		// and plain bearer auth, and maps thinking_level to reasoning.effort.
+		if cfg.APIKey() == "" {
+			return nil, "", fmt.Errorf("api_key is required for HTTP-based protocol %q", protocol)
+		}
+		apiBase := cfg.APIBase
+		if apiBase == "" {
+			apiBase = "https://api.openai.com"
+		}
+		provider := azure.NewProvider(
+			cfg.APIKey(),
+			apiBase,
+			cfg.Proxy,
+			userAgent,
+			azure.WithRequestTimeout(time.Duration(cfg.RequestTimeout)*time.Second),
+			azure.WithResponsesAPIPath("v1/responses"),
+		)
+		return finalizeProviderFromConfig(provider, modelID, cfg)
+
 	case "azure":
 		// Azure OpenAI uses deployment-based URLs. Auth is Bearer token via api_key
 		// when set; otherwise falls back to Entra ID (DefaultAzureCredential).

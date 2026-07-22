@@ -137,6 +137,76 @@ func TestProviderChat_AzureUsesMaxOutputTokens(t *testing.T) {
 	}
 }
 
+func TestProviderChat_ResponsesAPIPathOverride(t *testing.T) {
+	var capturedPath string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		writeValidResponse(w)
+	}))
+	defer server.Close()
+
+	p := NewProvider("test-key", server.URL, "", "", WithResponsesAPIPath("v1/responses"))
+	_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "gpt-5.6-sol", nil)
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+
+	if capturedPath != "/v1/responses" {
+		t.Errorf("URL path = %q, want %q", capturedPath, "/v1/responses")
+	}
+}
+
+func TestProviderChat_ThinkingLevelMapsToReasoningEffort(t *testing.T) {
+	cases := []struct {
+		level      string
+		wantEffort string // "" means reasoning must be absent
+	}{
+		{"high", "high"},
+		{"xhigh", "xhigh"},
+		{"low", "low"},
+		{"medium", "medium"},
+		{"off", "none"},
+		{"adaptive", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		var requestBody map[string]any
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewDecoder(r.Body).Decode(&requestBody)
+			writeValidResponse(w)
+		}))
+
+		opts := map[string]any{}
+		if tc.level != "" {
+			opts["thinking_level"] = tc.level
+		}
+		p := NewProvider("test-key", server.URL, "", "")
+		_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "deployment", opts)
+		server.Close()
+		if err != nil {
+			t.Fatalf("Chat(thinking_level=%q) error = %v", tc.level, err)
+		}
+
+		reasoning, present := requestBody["reasoning"].(map[string]any)
+		if tc.wantEffort == "" {
+			if present {
+				t.Errorf("thinking_level=%q: reasoning = %v, want absent", tc.level, reasoning)
+			}
+			continue
+		}
+		if !present || reasoning["effort"] != tc.wantEffort {
+			t.Errorf("thinking_level=%q: reasoning = %v, want effort %q", tc.level, reasoning, tc.wantEffort)
+		}
+	}
+}
+
+func TestProviderSupportsThinking(t *testing.T) {
+	if !NewProvider("k", "https://example.com", "", "").SupportsThinking() {
+		t.Error("SupportsThinking() = false, want true")
+	}
+}
+
 func TestProviderChat_AzureStoreIsFalse(t *testing.T) {
 	var requestBody map[string]any
 
