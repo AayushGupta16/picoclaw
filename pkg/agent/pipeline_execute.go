@@ -437,11 +437,13 @@ toolLoop:
 		}
 
 		if al.hooks != nil {
+			_, registered := ts.agent.Tools.Get(toolName)
 			approval := al.hooks.ApproveTool(turnCtx, &ToolApprovalRequest{
-				Meta:      ts.eventMeta("runTurn", "turn.tool.approve"),
-				Context:   cloneTurnContext(ts.turnCtx),
-				Tool:      toolName,
-				Arguments: toolArgs,
+				Meta:       ts.eventMeta("runTurn", "turn.tool.approve"),
+				Context:    cloneTurnContext(ts.turnCtx),
+				Tool:       toolName,
+				Arguments:  toolArgs,
+				Registered: registered,
 			})
 			if !approval.Approved {
 				exec.allResponsesHandled = false

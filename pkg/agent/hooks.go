@@ -154,10 +154,11 @@ func (r *ToolCallHookRequest) Clone() *ToolCallHookRequest {
 }
 
 type ToolApprovalRequest struct {
-	Meta      HookMeta       `json:"meta"`
-	Context   *TurnContext   `json:"context,omitempty"`
-	Tool      string         `json:"tool"`
-	Arguments map[string]any `json:"arguments,omitempty"`
+	Meta       HookMeta       `json:"meta"`
+	Context    *TurnContext   `json:"context,omitempty"`
+	Tool       string         `json:"tool"`
+	Arguments  map[string]any `json:"arguments,omitempty"`
+	Registered bool           `json:"registered"`
 }
 
 func (r *ToolApprovalRequest) Clone() *ToolApprovalRequest {
