@@ -2,6 +2,8 @@ package fstools
 
 import (
 	"context"
+	"image"
+	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +19,52 @@ func TestLoadImage_PathRequired(t *testing.T) {
 	result := tool.Execute(ctx, map[string]any{})
 	if !result.IsError {
 		t.Fatal("expected error for missing path")
+	}
+}
+
+func TestLoadImage_ResizesForManyImageLimit(t *testing.T) {
+	dir := t.TempDir()
+	imgPath := filepath.Join(dir, "wide.png")
+	f, err := os.Create(imgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(f, image.NewRGBA(image.Rect(0, 0, 2120, 100))); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store := media.NewFileMediaStore()
+	tool := NewLoadImageTool(dir, false, 0, store)
+	ctx := WithToolContext(context.Background(), "test", "chat1")
+	result := tool.Execute(ctx, map[string]any{"path": imgPath})
+	if result.IsError {
+		t.Fatalf("expected success, got: %s", result.ForLLM)
+	}
+
+	storedPath, meta, err := store.ResolveWithMeta(result.Media[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedPath == imgPath {
+		t.Fatal("expected oversized image to be stored as a resized copy")
+	}
+	if meta.ContentType != "image/jpeg" {
+		t.Fatalf("content type = %q, want image/jpeg", meta.ContentType)
+	}
+	resizedFile, err := os.Open(storedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resizedFile.Close()
+	cfg, _, err := image.DecodeConfig(resizedFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Width != maxVisionImageDimension || cfg.Height >= maxVisionImageDimension {
+		t.Fatalf("resized dimensions = %dx%d, want width %d and smaller height", cfg.Width, cfg.Height, maxVisionImageDimension)
 	}
 }
 

@@ -3,6 +3,8 @@ package fstools
 import (
 	"context"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -10,7 +12,15 @@ import (
 
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/media"
+	_ "golang.org/x/image/bmp"
+	"golang.org/x/image/draw"
+	_ "golang.org/x/image/webp"
 )
+
+// Anthropic rejects any side over 2,000 px once a request contains enough
+// images to use its many-image limits. Keep a little headroom so provider-side
+// metadata or rounding can never turn a valid load_image result into a 400.
+const maxVisionImageDimension = 1900
 
 // LoadImageTool loads a local image file into the MediaStore and returns a
 // media:// reference. The agent loop's resolveMediaRefs will then base64-encode
@@ -135,15 +145,26 @@ func (t *LoadImageTool) Execute(ctx context.Context, args map[string]any) *ToolR
 	}
 
 	filename := filepath.Base(resolved)
+	storedPath, storedType, resized, err := normalizeVisionImage(resolved)
+	if err != nil {
+		return ErrorResult(fmt.Sprintf("failed to prepare image: %v", err))
+	}
+	cleanupPolicy := media.CleanupPolicyForgetOnly
+	if resized {
+		cleanupPolicy = media.CleanupPolicyDeleteOnCleanup
+	}
 	scope := fmt.Sprintf("tool:load_image:%s:%s", channel, chatID)
 
-	ref, err := t.mediaStore.Store(resolved, media.MediaMeta{
+	ref, err := t.mediaStore.Store(storedPath, media.MediaMeta{
 		Filename:      filename,
-		ContentType:   mediaType,
+		ContentType:   storedType,
 		Source:        "tool:load_image",
-		CleanupPolicy: media.CleanupPolicyForgetOnly,
+		CleanupPolicy: cleanupPolicy,
 	}, scope)
 	if err != nil {
+		if resized {
+			_ = os.Remove(storedPath)
+		}
 		return ErrorResult(fmt.Sprintf("failed to register image in media store: %v", err))
 	}
 
@@ -160,4 +181,49 @@ func (t *LoadImageTool) Execute(ctx context.Context, args map[string]any) *ToolR
 		// that would send the file to the user channel instead.
 		Media: []string{ref},
 	}
+}
+
+func normalizeVisionImage(path string) (storedPath, contentType string, resized bool, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", "", false, err
+	}
+	defer f.Close()
+
+	cfg, format, err := image.DecodeConfig(f)
+	if err != nil {
+		return "", "", false, fmt.Errorf("decode dimensions: %w", err)
+	}
+	if cfg.Width <= maxVisionImageDimension && cfg.Height <= maxVisionImageDimension {
+		return path, "image/" + format, false, nil
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		return "", "", false, err
+	}
+	src, _, err := image.Decode(f)
+	if err != nil {
+		return "", "", false, fmt.Errorf("decode pixels: %w", err)
+	}
+
+	scale := float64(maxVisionImageDimension) / float64(max(cfg.Width, cfg.Height))
+	width := max(1, int(float64(cfg.Width)*scale))
+	height := max(1, int(float64(cfg.Height)*scale))
+	dst := image.NewRGBA(image.Rect(0, 0, width, height))
+	draw.CatmullRom.Scale(dst, dst.Bounds(), src, src.Bounds(), draw.Over, nil)
+
+	tmp, err := os.CreateTemp("", "picoclaw-load-image-*.jpg")
+	if err != nil {
+		return "", "", false, err
+	}
+	tmpPath := tmp.Name()
+	if err := jpeg.Encode(tmp, dst, &jpeg.Options{Quality: 90}); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return "", "", false, fmt.Errorf("encode resized image: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", "", false, err
+	}
+	return tmpPath, "image/jpeg", true, nil
 }
