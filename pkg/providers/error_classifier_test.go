@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"syscall"
 	"testing"
+
+	"github.com/sipeed/picoclaw/pkg/providers/common"
 )
 
 type stubNetError struct {
@@ -343,6 +345,105 @@ func TestClassifyError_FormatPatterns(t *testing.T) {
 	}
 }
 
+func TestClassifyError_ContentPolicyPatterns(t *testing.T) {
+	patterns := []string{
+		`API request failed:
+  Status: 400
+  Body:   {"error":{"message":"This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your prompt.","type":"invalid_request_error","code":"invalid_prompt"}}`,
+		`{"error":{"code":"content_policy_violation","message":"Your request was rejected as a result of our safety system."}}`,
+		"your request was rejected because it violates our usage policies",
+		"the response was filtered due to the prompt triggering azure openai's content management policy",
+		"output blocked by content filtering policy",
+		"blocked by responsible ai service",
+		"request flagged by moderation",
+		"prohibited content detected in prompt",
+	}
+
+	for _, msg := range patterns {
+		err := errors.New(msg)
+		result := ClassifyError(err, "openai-responses", "gpt-5.6-sol")
+		if result == nil {
+			t.Errorf("pattern %q: expected non-nil", msg)
+			continue
+		}
+		if result.Reason != FailoverContentPolicy {
+			t.Errorf("pattern %q: reason = %q, want content_policy", msg, result.Reason)
+			continue
+		}
+		if !result.IsRetriable() {
+			t.Errorf("pattern %q: content policy error should be retriable", msg)
+		}
+	}
+}
+
+func TestClassifyError_ContentPolicyPreservesStatus(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "structured http error",
+			err: &common.HTTPError{
+				StatusCode:  400,
+				BodyPreview: `{"error":{"message":"This content was flagged for possible cybersecurity risk.","code":"invalid_prompt"}}`,
+			},
+		},
+		{
+			name: "status in message",
+			err:  errors.New("API error: status: 400 request rejected by our safety system"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ClassifyError(tt.err, "openai-responses", "gpt-5.6-sol")
+			if result == nil {
+				t.Fatal("expected non-nil")
+			}
+			if result.Reason != FailoverContentPolicy {
+				t.Fatalf("reason = %q, want content_policy", result.Reason)
+			}
+			if result.Status != 400 {
+				t.Fatalf("status = %d, want 400", result.Status)
+			}
+		})
+	}
+}
+
+// Content policy patterns must not widen the format class: a genuine malformed
+// request stays non-retriable so the chain still aborts instead of replaying it.
+func TestClassifyError_FormatErrorsStayNonRetriable(t *testing.T) {
+	patterns := []string{
+		"string should match pattern",
+		"tool_use.id is required",
+		"invalid tool_use_id",
+		"messages.1.content.1.tool_use.id must be valid",
+		"invalid request format",
+		"error code: 1210",
+		"error code 1210",
+		"zhipu api error code: 1210",
+		"image dimensions exceed max allowed 2048x2048",
+		"image exceeds 20 mb limit",
+		"API error: status: 400 something went wrong",
+	}
+
+	for _, msg := range patterns {
+		err := errors.New(msg)
+		result := ClassifyError(err, "anthropic", "claude")
+		if result == nil {
+			t.Errorf("pattern %q: expected non-nil", msg)
+			continue
+		}
+		if result.Reason != FailoverFormat {
+			t.Errorf("pattern %q: reason = %q, want format", msg, result.Reason)
+			continue
+		}
+		if result.IsRetriable() {
+			t.Errorf("pattern %q: format error should not be retriable", msg)
+		}
+	}
+}
+
 func TestClassifyError_ImageDimensionError(t *testing.T) {
 	err := errors.New("image dimensions exceed max allowed 2048x2048")
 	result := ClassifyError(err, "openai", "gpt-4o")
@@ -426,6 +527,7 @@ func TestFailoverError_IsRetriable(t *testing.T) {
 		{FailoverTimeout, true},
 		{FailoverOverloaded, true},
 		{FailoverFormat, false},
+		{FailoverContentPolicy, true},
 		{FailoverContextOverflow, false},
 		{FailoverUnknown, true},
 	}

@@ -120,6 +120,31 @@ var (
 		substr("error code 1210"),
 		substr("zhipu api error code: 1210"),
 	}
+
+	// Provider safety/policy refusals. Kept narrow on purpose: a pattern loose
+	// enough to also match a malformed-request body would make real format
+	// errors retriable across every candidate in the chain.
+	contentPolicyPatterns = []errorPattern{
+		substr("content was flagged"),
+		rxp(`flagged for possible \w+ risk`),
+		substr("content policy"),
+		substr("content_policy"),
+		substr("content management policy"),
+		substr("content filter"),
+		substr("content_filter"),
+		substr("content filtering"),
+		substr("policy violation"),
+		substr("violates our policies"),
+		substr("usage policies"),
+		substr("usage policy"),
+		substr("prohibited content"),
+		substr("safety system"),
+		substr("safety filter"),
+		substr("responsible ai"),
+		substr("invalid_prompt"),
+		substr("moderation"),
+	}
+
 	contextOverflowPatterns = []errorPattern{
 		rxp(`context[_ ]?length[_ ]?exceeded`),
 		rxp(`context[_ ]?window[_ ]?exceeded`),
@@ -189,6 +214,26 @@ func ClassifyError(err error, provider, model string) *FailoverError {
 			Model:    model,
 			Wrapped:  err,
 		}
+	}
+
+	// Providers overload HTTP 400 for two unrelated failures: a malformed
+	// request, which no other model will accept either, and a safety/policy
+	// refusal, which another model may well accept. Only the body tells them
+	// apart, so the body wins over the status here.
+	if matchesAny(msg, contentPolicyPatterns) {
+		failErr := &FailoverError{
+			Reason:   FailoverContentPolicy,
+			Provider: provider,
+			Model:    model,
+			Wrapped:  err,
+		}
+		var httpErr *common.HTTPError
+		if errors.As(err, &httpErr) && httpErr != nil {
+			failErr.Status = httpErr.StatusCode
+		} else if status := extractHTTPStatus(msg); status > 0 {
+			failErr.Status = status
+		}
+		return failErr
 	}
 
 	// Try HTTP status code extraction first.

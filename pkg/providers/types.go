@@ -90,6 +90,7 @@ const (
 	FailoverNetwork         FailoverReason = "network"
 	FailoverTimeout         FailoverReason = "timeout"
 	FailoverFormat          FailoverReason = "format"
+	FailoverContentPolicy   FailoverReason = "content_policy"
 	FailoverContextOverflow FailoverReason = "context_overflow"
 	FailoverOverloaded      FailoverReason = "overloaded"
 	FailoverUnknown         FailoverReason = "unknown"
