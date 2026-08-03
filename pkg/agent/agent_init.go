@@ -72,7 +72,8 @@ func NewAgentLoop(
 		cmdRegistry:       commands.NewRegistry(commands.BuiltinDefinitions()),
 		evolution:         bridge,
 		steering:          newSteeringQueue(parseSteeringMode(cfg.Agents.Defaults.SteeringMode)),
-		workerSem:         make(chan struct{}, workerPoolSize),
+		turns:             newTurnGate(workerPoolSize),
+		backgroundTurns:   newBackgroundTurnQueue(),
 		ownsRuntimeEvents: true,
 	}
 	for _, opt := range opts {

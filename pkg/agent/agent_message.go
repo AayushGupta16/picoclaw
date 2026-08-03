@@ -33,16 +33,28 @@ func (al *AgentLoop) buildContinuationTarget(msg bus.InboundMessage) (*continuat
 	}, nil
 }
 
+// ProcessDirect runs a turn for a message typed at the CLI.
 func (al *AgentLoop) ProcessDirect(
 	ctx context.Context,
 	content, sessionKey string,
 ) (string, error) {
-	return al.ProcessDirectWithChannel(ctx, content, sessionKey, "cli", "direct")
+	return al.processDirect(ctx, content, sessionKey, "cli", "direct", laneHuman)
 }
 
+// ProcessDirectWithChannel runs a turn the agent scheduled for itself; the
+// cron service is its only caller. It admits on the background lane so a
+// firing job yields the next turn slot to an inbound human message.
 func (al *AgentLoop) ProcessDirectWithChannel(
 	ctx context.Context,
 	content, sessionKey, channel, chatID string,
+) (string, error) {
+	return al.processDirect(ctx, content, sessionKey, channel, chatID, laneBackground)
+}
+
+func (al *AgentLoop) processDirect(
+	ctx context.Context,
+	content, sessionKey, channel, chatID string,
+	lane turnLane,
 ) (string, error) {
 	if err := al.ensureHooksInitialized(ctx); err != nil {
 		return "", err
@@ -50,6 +62,11 @@ func (al *AgentLoop) ProcessDirectWithChannel(
 	if err := al.ensureMCPInitialized(ctx); err != nil {
 		return "", err
 	}
+
+	if err := al.turns.acquire(ctx, lane); err != nil {
+		return "", err
+	}
+	defer al.turns.release()
 
 	msg := bus.InboundMessage{
 		Context: bus.InboundContext{

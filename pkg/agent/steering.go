@@ -149,6 +149,24 @@ func (sq *steeringQueue) len() int {
 	return total
 }
 
+// pendingScopes returns the session-scoped queues that currently hold
+// messages. The legacy manual scope is left out: it has no session to start a
+// turn for.
+func (sq *steeringQueue) pendingScopes() []string {
+	sq.mu.Lock()
+	defer sq.mu.Unlock()
+
+	var scopes []string
+	for scope, queue := range sq.queues {
+		if scope == manualSteeringScope || len(queue) == 0 {
+			continue
+		}
+		scopes = append(scopes, scope)
+	}
+	sort.Strings(scopes)
+	return scopes
+}
+
 // lenScope returns the number of queued messages for a specific scope.
 func (sq *steeringQueue) lenScope(scope string) int {
 	sq.mu.Lock()
@@ -195,6 +213,28 @@ func (al *AgentLoop) Steer(msg providers.Message) error {
 	return al.enqueueSteeringMessage(scope, agentID, msg)
 }
 
+func (al *AgentLoop) steeringEventMeta(scope, agentID, tracePath string) HookMeta {
+	if ts := al.getAnyActiveTurnState(); ts != nil {
+		return ts.eventMeta("Steer", tracePath)
+	}
+
+	meta := HookMeta{Source: "Steer", TracePath: tracePath}
+	if strings.TrimSpace(agentID) != "" {
+		meta.AgentID = agentID
+	}
+	if normalizedScope := normalizeSteeringScope(scope); normalizedScope != manualSteeringScope {
+		meta.SessionKey = normalizedScope
+	}
+	if meta.AgentID == "" {
+		if registry := al.GetRegistry(); registry != nil {
+			if agent := registry.GetDefaultAgent(); agent != nil {
+				meta.AgentID = agent.ID
+			}
+		}
+	}
+	return meta
+}
+
 func (al *AgentLoop) enqueueSteeringMessage(scope, agentID string, msg providers.Message) error {
 	if al.steering == nil {
 		return fmt.Errorf("steering queue is not initialized")
@@ -207,6 +247,16 @@ func (al *AgentLoop) enqueueSteeringMessage(scope, agentID string, msg providers
 			"role":  msg.Role,
 			"scope": normalizeSteeringScope(scope),
 		})
+		// A full queue drops the message outright, so it has to leave a trace
+		// an operator can find — a warning in the gateway's own log is not one.
+		al.emitEvent(
+			runtimeevents.KindAgentError,
+			al.steeringEventMeta(scope, agentID, "turn.interrupt.dropped"),
+			ErrorPayload{
+				Stage:   "steering_enqueue",
+				Message: err.Error(),
+			},
+		)
 		return err
 	}
 
@@ -219,32 +269,9 @@ func (al *AgentLoop) enqueueSteeringMessage(scope, agentID string, msg providers
 		"scope":       normalizeSteeringScope(scope),
 	})
 
-	meta := HookMeta{
-		Source:    "Steer",
-		TracePath: "turn.interrupt.received",
-	}
-	if ts := al.getAnyActiveTurnState(); ts != nil {
-		meta = ts.eventMeta("Steer", "turn.interrupt.received")
-	} else {
-		if strings.TrimSpace(agentID) != "" {
-			meta.AgentID = agentID
-		}
-		normalizedScope := normalizeSteeringScope(scope)
-		if normalizedScope != manualSteeringScope {
-			meta.SessionKey = normalizedScope
-		}
-		if meta.AgentID == "" {
-			if registry := al.GetRegistry(); registry != nil {
-				if agent := registry.GetDefaultAgent(); agent != nil {
-					meta.AgentID = agent.ID
-				}
-			}
-		}
-	}
-
 	al.emitEvent(
 		runtimeevents.KindAgentInterruptReceived,
-		meta,
+		al.steeringEventMeta(scope, agentID, "turn.interrupt.received"),
 		InterruptReceivedPayload{
 			Kind:       InterruptKindSteering,
 			Role:       msg.Role,

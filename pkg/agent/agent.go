@@ -62,8 +62,18 @@ type AgentLoop struct {
 	pendingStops   sync.Map
 	mu             sync.RWMutex
 
-	// workerSem limits concurrent turn processing workers.
-	workerSem chan struct{}
+	// turns admits every turn — inbound, cron and self-generated alike — so
+	// there is one place where a human message can be let in first.
+	turns *turnGate
+	// backgroundTurns holds self-generated inbound messages for the
+	// background runner; they must never execute on the receive loop.
+	backgroundTurns *backgroundTurnQueue
+	// steeringTargets remembers where a scope's queued messages arrived from,
+	// so a turn started for them later still answers in the right room.
+	steeringTargets sync.Map
+	// sweepingScopes guards against dispatching two recovery turns for the
+	// same stranded scope.
+	sweepingScopes sync.Map
 
 	// activeTurnStates tracks active turns per session to prevent duplicates.
 	activeTurnStates sync.Map
@@ -153,6 +163,8 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 		return err
 	}
 
+	go al.runBackgroundTurns(ctx)
+
 	idleTicker := time.NewTicker(100 * time.Millisecond)
 	defer idleTicker.Stop()
 
@@ -164,6 +176,7 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 			if !al.running.Load() {
 				return nil
 			}
+			al.sweepStrandedSteering(ctx)
 		case msg, ok := <-al.bus.InboundChan():
 			if !ok {
 				return nil
@@ -172,10 +185,11 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 			// Resolve the session key for this message
 			sessionKey, agentID, ok := al.resolveSteeringTarget(msg)
 			if !ok {
-				// Non-routable message (e.g., system) — process immediately.
-				// Note: system messages are processed in the main goroutine,
-				// so they block the receive loop but guarantee session serialization.
-				al.processMessageSync(ctx, msg)
+				// Non-routable message (e.g., system) — hand to the background
+				// runner, which keeps them serialized and in order. Running one
+				// here would stop this loop from draining the bus for the whole
+				// turn, which is how a subagent fan-out made the agent deaf.
+				al.backgroundTurns.push(msg)
 				continue
 			}
 
@@ -197,6 +211,11 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 				msg = al.prepareInboundMessageForAgent(ctx, msg)
 
 				// Another turn is already active (or reserved) for this session — enqueue
+				al.rememberSteeringTarget(continuationTarget{
+					SessionKey: sessionKey,
+					Channel:    msg.Channel,
+					ChatID:     msg.ChatID,
+				})
 				if err := al.enqueueSteeringMessage(sessionKey, agentID, providers.Message{
 					Role:    "user",
 					Content: msg.Content,
@@ -213,16 +232,12 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 				continue
 			}
 
-			// Session claimed — spawn a worker goroutine that acquires a semaphore
+			// Session claimed — spawn a worker goroutine that acquires a turn
 			// slot. The goroutine is spawned immediately so the main loop keeps
-			// draining the inbound channel. The goroutine blocks on the semaphore.
+			// draining the inbound channel. The goroutine blocks on the gate.
 			go func(m bus.InboundMessage, ph *turnState) {
 				var releaseSession bool
-				// Acquire semaphore slot (blocks if at capacity)
-				select {
-				case al.workerSem <- struct{}{}:
-					// Got slot, start worker
-				case <-ctx.Done():
+				if err := al.turns.acquire(ctx, laneHuman); err != nil {
 					// Context canceled while waiting for a slot — clean up the
 					// placeholder to prevent session-level deadlock.
 					al.releaseSessionTurnState(sessionKey, nil)
@@ -266,7 +281,7 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 							})
 					}
 				}()
-				defer func() { <-al.workerSem }() // Release slot
+				defer al.turns.release()
 
 				if al.channelManager != nil {
 					defer al.channelManager.InvokeTypingStop(m.Channel, m.ChatID)
