@@ -335,6 +335,41 @@ func TestParseResponseBody_TextOutput(t *testing.T) {
 	}
 }
 
+func TestParseResponseBody_CachedTokensSplitOutOfPrompt(t *testing.T) {
+	body := strings.NewReader(fmt.Sprintf(`{
+		"id": "resp_789",
+		"object": "response",
+		"status": "%s",
+		"output": [
+			{
+				"type": "message",
+				"content": [{"type": "output_text", "text": "ok"}]
+			}
+		],
+		"usage": {
+			"input_tokens": 2907,
+			"output_tokens": 5,
+			"total_tokens": 2912,
+			"input_tokens_details": {"cached_tokens": 2874},
+			"output_tokens_details": {"reasoning_tokens": 0}
+		}
+	}`, string(responses.ResponseStatusCompleted)))
+
+	result, err := ParseResponseBody(body)
+	if err != nil {
+		t.Fatalf("ParseResponseBody error: %v", err)
+	}
+	if result.Usage.CacheReadInputTokens != 2874 {
+		t.Errorf("CacheReadInputTokens = %d, want 2874", result.Usage.CacheReadInputTokens)
+	}
+	if result.Usage.PromptTokens != 33 {
+		t.Errorf("PromptTokens = %d, want 33 (input minus cached)", result.Usage.PromptTokens)
+	}
+	if result.Usage.TotalTokens != 2912 {
+		t.Errorf("TotalTokens = %d, want 2912", result.Usage.TotalTokens)
+	}
+}
+
 func TestParseResponseBody_FunctionCall(t *testing.T) {
 	body := strings.NewReader(fmt.Sprintf(`{
 		"id": "resp_456",

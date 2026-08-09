@@ -261,10 +261,14 @@ func parseResponse(apiResp *responses.Response) *protocoltypes.LLMResponse {
 
 	var usage *protocoltypes.UsageInfo
 	if apiResp.Usage.TotalTokens > 0 {
+		// OpenAI's input_tokens INCLUDES cache reads; UsageInfo.PromptTokens
+		// excludes them (Anthropic convention), so split the cached share out.
+		cached := int(apiResp.Usage.InputTokensDetails.CachedTokens)
 		usage = &protocoltypes.UsageInfo{
-			PromptTokens:     int(apiResp.Usage.InputTokens),
-			CompletionTokens: int(apiResp.Usage.OutputTokens),
-			TotalTokens:      int(apiResp.Usage.TotalTokens),
+			PromptTokens:         int(apiResp.Usage.InputTokens) - cached,
+			CompletionTokens:     int(apiResp.Usage.OutputTokens),
+			TotalTokens:          int(apiResp.Usage.TotalTokens),
+			CacheReadInputTokens: cached,
 		}
 	}
 
