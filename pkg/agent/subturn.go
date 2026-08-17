@@ -497,17 +497,26 @@ func spawnSubTurn(
 		semAcquired = false // prevent the defer from double-releasing
 	}
 
-	// Convert turnResult to tools.ToolResult
+	// Convert turnResult to tools.ToolResult.
+	//
+	// Silent on purpose: a sub-turn's report is input for the PARENT agent
+	// (ForLLM via the sync return or the async follow-up injection), not a
+	// user-facing message. Before this, every spawn/delegate completion
+	// echoed the worker's raw report into the channel — dozens of
+	// "rows=50 ..." dumps nobody reads, drowning the agent's own replies.
+	// The parent decides what, if anything, the user should see.
 	if turnErr != nil {
 		err = turnErr
 		result = &tools.ToolResult{
 			Err:    turnErr,
 			ForLLM: fmt.Sprintf("SubTurn failed: %v", turnErr),
+			Silent: true,
 		}
 	} else {
 		result = &tools.ToolResult{
 			ForLLM:  turnRes.finalContent,
 			ForUser: turnRes.finalContent,
+			Silent:  true,
 		}
 	}
 
